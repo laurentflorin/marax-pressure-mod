@@ -173,7 +173,7 @@ float flowRate = 0.0f;
 
 #define OLS_WINDOW 10
 const float DEFAULT_OLS_BETA[3] = {3.5f, 1.2f, 0.1f};
-float olsBeta[3] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2]}; // β0 intercept, β1 flow, β2 pressure initial defaults before model training
+float olsBeta[3] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2]}; // Initial OLS coefficients: β0 intercept, β1 flow-rate coefficient, β2 pressure coefficient.
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
 int olsCount = 0;
@@ -392,7 +392,7 @@ float predictedFinalWeight()
 
 void fitOLS()
 {
-  if (olsCount < OLS_MIN_OBSERVATIONS) // Need at least 3 observations to fit the 3-parameter model.
+  if (olsCount < OLS_MIN_OBSERVATIONS)
   {
     return;
   }
