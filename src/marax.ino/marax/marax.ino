@@ -5,6 +5,19 @@
 #include <WiFiNINA.h>
 #include <PubSubClient.h>
 #include <dimmable_light.h>
+#include <SD.h>
+
+// === Required Libraries ===
+// - EasyNextionLibrary     (Arduino Library Manager)
+// - WiFiNINA               (Arduino Library Manager)
+// - PubSubClient           (Arduino Library Manager)
+// - dimmable_light         (Arduino Library Manager)
+// - SD                     (Arduino built-in)
+// - ArduinoBLE             (Arduino Library Manager)
+// - AcaiaArduinoBLE        (manual install: https://github.com/baettigp/Acaia_Felicita_ArduinoBLE)
+// Requires: baettigp/Acaia_Felicita_ArduinoBLE library
+// https://github.com/baettigp/Acaia_Felicita_ArduinoBLE
+#include <AcaiaArduinoBLE.h>
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu Wifi
@@ -91,7 +104,7 @@ bool heatingElementOn = false;
 // nunununununununununununu Pins
 // nunununununununununununununununununununununununununununununun
 int brewSwitchRelayPin = 10; // Relay to tell MaraxCard that a brew is active
-int brewSwitchPin = 11;      // Brew Switch
+int brewSwitchPin = 7;       // moved from 11 — D11 now used by SD card MOSI
 
 float i = 0;
 float V, P, B;
@@ -129,6 +142,39 @@ bool displayIsInSleep = true;
 // nunununununununununununununununununununununununununununununun
 int t1p = 0, t1t = 0, t2p = 0, t2t = 0, t3p = 0, t3t = 0, t4p = 0, t4t = 0;
 int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
+
+// SD / Profile globals
+#define SD_CS_PIN 4
+#define MAX_PROFILES 10
+char activeProfileName[32] = "default";
+char activeProfileFileStem[32] = "default";
+char profileNames[MAX_PROFILES][32];
+int profileCount = 0;
+String profileListStr = "";
+int selectedProfileIndex = 0;
+float targetWeight = 36.0f;
+bool sdReady = false;
+
+AcaiaArduinoBLE scale(false);
+bool scaleConnected = false;
+float currentWeight = 0.0f;
+float prevWeight = 0.0f;
+unsigned long lastWeightTime = 0;
+float flowRate = 0.0f;
+
+#define OLS_WINDOW 10
+float olsBeta[3] = {3.5f, 1.2f, 0.1f};
+float olsX[OLS_WINDOW][2];
+float olsY[OLS_WINDOW];
+int olsCount = 0;
+int olsWriteIndex = 0;
+
+bool pendingObservation = false;
+unsigned long pendingObsTime = 0;
+float pendingFlowAtStop = 0.0f;
+float pendingPressAtStop = 0.0f;
+float pendingWeightAtStop = 0.0f;
+int pendingBrewTimeS = 0;
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu LowPassFilterStuff
@@ -195,6 +241,43 @@ void setup()
     WiFi.begin(wifi_ssid, wifi_password);
   }
   delay(2000);
+
+  // SD card init
+  if (SD.begin(SD_CS_PIN))
+  {
+    sdReady = true;
+
+    if (!SD.exists("/profiles"))
+      SD.mkdir("/profiles");
+    if (!SD.exists("/models"))
+      SD.mkdir("/models");
+    if (!SD.exists("/logs"))
+      SD.mkdir("/logs");
+
+    if (!SD.exists("/logs/brews.csv"))
+    {
+      File f = SD.open("/logs/brews.csv", FILE_WRITE);
+      if (f)
+      {
+        f.println("timestamp_ms,profile,actual_weight,target_weight,brew_time_s,flow_rate_at_stop,pressure_at_stop,extra_weight");
+        f.close();
+      }
+    }
+
+    scanProfiles();
+
+    if (profileCount > 0 && loadProfile(profileNames[0]))
+    {
+      selectedProfileIndex = 0;
+      loadBeta();
+      loadObservations();
+    }
+
+    myNex.writeStr("profileList.txt", profileListStr.c_str());
+    myNex.writeStr("activeProfile.txt", activeProfileName);
+  }
+
+  scaleConnected = scale.init();
 }
 
 // nunununununununununununununununununununununununununununununun
@@ -202,6 +285,9 @@ void setup()
 // nunununununununununununununununununununununununununununununun
 void loop()
 {
+  updateScale();
+  checkPendingObservation();
+
   if (!mqttClient.connected())
   {
     reconnect();
@@ -287,6 +373,495 @@ char *toCharArray(String str)
 {
   return &str[0];
 }
+
+float predictedFinalWeight()
+{
+  float p = getPressure();
+  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * p;
+}
+
+void fitOLS()
+{
+  if (olsCount < 3)
+  {
+    return;
+  }
+
+  double XtX[3][3] = {};
+  double Xty[3] = {};
+
+  for (int i = 0; i < olsCount; i++)
+  {
+    double row[3] = {1.0, (double)olsX[i][0], (double)olsX[i][1]};
+    for (int r = 0; r < 3; r++)
+    {
+      Xty[r] += row[r] * olsY[i];
+      for (int c = 0; c < 3; c++)
+      {
+        XtX[r][c] += row[r] * row[c];
+      }
+    }
+  }
+
+  double A[3][4];
+  for (int r = 0; r < 3; r++)
+  {
+    for (int c = 0; c < 3; c++)
+    {
+      A[r][c] = XtX[r][c];
+    }
+    A[r][3] = Xty[r];
+  }
+
+  for (int col = 0; col < 3; col++)
+  {
+    int pivot = col;
+    for (int row = col + 1; row < 3; row++)
+    {
+      if (fabs(A[row][col]) > fabs(A[pivot][col]))
+      {
+        pivot = row;
+      }
+    }
+
+    for (int c = 0; c <= 3; c++)
+    {
+      double tmp = A[col][c];
+      A[col][c] = A[pivot][c];
+      A[pivot][c] = tmp;
+    }
+
+    if (fabs(A[col][col]) < 1e-10)
+    {
+      return;
+    }
+
+    for (int row = 0; row < 3; row++)
+    {
+      if (row == col)
+      {
+        continue;
+      }
+
+      double factor = A[row][col] / A[col][col];
+      for (int c = col; c <= 3; c++)
+      {
+        A[row][c] -= factor * A[col][c];
+      }
+    }
+  }
+
+  for (int i = 0; i < 3; i++)
+  {
+    olsBeta[i] = (float)(A[i][3] / A[i][i]);
+  }
+}
+
+bool loadProfile(const char *filename)
+{
+  if (!sdReady)
+  {
+    return false;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/profiles/%s", filename);
+  File f = SD.open(path);
+  if (!f)
+  {
+    return false;
+  }
+
+  String line;
+  f.readStringUntil('\n');
+  line = f.readStringUntil('\n');
+  f.close();
+  line.trim();
+
+  strncpy(activeProfileFileStem, filename, sizeof(activeProfileFileStem) - 1);
+  activeProfileFileStem[sizeof(activeProfileFileStem) - 1] = '\0';
+  char *ext = strrchr(activeProfileFileStem, '.');
+  if (ext != NULL)
+  {
+    *ext = '\0';
+  }
+
+  strncpy(activeProfileName, activeProfileFileStem, sizeof(activeProfileName) - 1);
+  activeProfileName[sizeof(activeProfileName) - 1] = '\0';
+
+  int idx = 0;
+  char buf[128];
+  line.toCharArray(buf, sizeof(buf));
+  char *token = strtok(buf, ",");
+  while (token != NULL)
+  {
+    switch (idx)
+    {
+    case 0:
+      strncpy(activeProfileName, token, sizeof(activeProfileName) - 1);
+      activeProfileName[sizeof(activeProfileName) - 1] = '\0';
+      break;
+    case 1:
+      t1p = atoi(token);
+      t1pWave = map(t1p, 0, 10, 0, 164);
+      break;
+    case 2:
+      t1t = atoi(token);
+      break;
+    case 3:
+      t2p = atoi(token);
+      t2pWave = map(t2p, 0, 10, 0, 164);
+      break;
+    case 4:
+      t2t = atoi(token);
+      break;
+    case 5:
+      t3p = atoi(token);
+      t3pWave = map(t3p, 0, 10, 0, 164);
+      break;
+    case 6:
+      t3t = atoi(token);
+      break;
+    case 7:
+      t4p = atoi(token);
+      t4pWave = map(t4p, 0, 10, 0, 164);
+      break;
+    case 8:
+      t4t = atoi(token);
+      break;
+    case 9:
+      targetWeight = atof(token);
+      break;
+    }
+    idx++;
+    token = strtok(NULL, ",");
+  }
+
+  return idx >= 10;
+}
+
+void loadBeta()
+{
+  olsBeta[0] = 3.5f;
+  olsBeta[1] = 1.2f;
+  olsBeta[2] = 0.1f;
+
+  if (!sdReady)
+  {
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
+  File f = SD.open(path);
+  if (!f)
+  {
+    return;
+  }
+
+  for (int i = 0; i < 3; i++)
+  {
+    if (f.available())
+    {
+      olsBeta[i] = f.readStringUntil('\n').toFloat();
+    }
+  }
+  f.close();
+}
+
+void saveBeta()
+{
+  if (!sdReady)
+  {
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
+  SD.remove(path);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f)
+  {
+    return;
+  }
+
+  for (int i = 0; i < 3; i++)
+  {
+    f.println(olsBeta[i], 6);
+  }
+  f.close();
+}
+
+void loadObservations()
+{
+  olsCount = 0;
+  olsWriteIndex = 0;
+
+  if (!sdReady)
+  {
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
+  File f = SD.open(path);
+  if (!f)
+  {
+    return;
+  }
+
+  f.readStringUntil('\n');
+
+  int lineCount = 0;
+  while (f.available())
+  {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0)
+    {
+      lineCount++;
+    }
+  }
+
+  f.seek(0);
+  f.readStringUntil('\n');
+
+  int skip = max(0, lineCount - OLS_WINDOW);
+  for (int i = 0; i < skip; i++)
+  {
+    f.readStringUntil('\n');
+  }
+
+  while (f.available() && olsCount < OLS_WINDOW)
+  {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0)
+    {
+      continue;
+    }
+
+    char buf[64];
+    line.toCharArray(buf, sizeof(buf));
+    char *tok = strtok(buf, ",");
+    int col = 0;
+    while (tok != NULL && col < 3)
+    {
+      if (col == 0)
+      {
+        olsX[olsCount][0] = atof(tok);
+      }
+      else if (col == 1)
+      {
+        olsX[olsCount][1] = atof(tok);
+      }
+      else if (col == 2)
+      {
+        olsY[olsCount] = atof(tok);
+      }
+      tok = strtok(NULL, ",");
+      col++;
+    }
+
+    if (col == 3)
+    {
+      olsCount++;
+    }
+  }
+
+  f.close();
+  olsWriteIndex = olsCount % OLS_WINDOW;
+  fitOLS();
+}
+
+void saveObservation(float flow, float pres, float extra)
+{
+  if (!sdReady)
+  {
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
+  bool exists = SD.exists(path);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f)
+  {
+    return;
+  }
+
+  if (!exists)
+  {
+    f.println("flow_rate_at_stop,pressure_at_stop,extra_weight");
+  }
+  f.print(flow, 4);
+  f.print(",");
+  f.print(pres, 4);
+  f.print(",");
+  f.println(extra, 4);
+  f.close();
+}
+
+void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float extra)
+{
+  if (!sdReady)
+  {
+    return;
+  }
+
+  File f = SD.open("/logs/brews.csv", FILE_WRITE);
+  if (!f)
+  {
+    return;
+  }
+
+  f.print(millis());
+  f.print(",");
+  f.print(activeProfileName);
+  f.print(",");
+  f.print(finalWeight, 2);
+  f.print(",");
+  f.print(targetWeight, 2);
+  f.print(",");
+  f.print(brewTimeS);
+  f.print(",");
+  f.print(flow, 4);
+  f.print(",");
+  f.print(pres, 4);
+  f.print(",");
+  f.println(extra, 4);
+  f.close();
+}
+
+void scanProfiles()
+{
+  profileCount = 0;
+  profileListStr = "";
+
+  if (!sdReady)
+  {
+    return;
+  }
+
+  File dir = SD.open("/profiles");
+  if (!dir)
+  {
+    return;
+  }
+
+  while (profileCount < MAX_PROFILES)
+  {
+    File entry = dir.openNextFile();
+    if (!entry)
+    {
+      break;
+    }
+
+    if (!entry.isDirectory())
+    {
+      String name = entry.name();
+      int slashIndex = name.lastIndexOf('/');
+      if (slashIndex >= 0)
+      {
+        name = name.substring(slashIndex + 1);
+      }
+
+      if (name.endsWith(".csv"))
+      {
+        name.toCharArray(profileNames[profileCount], sizeof(profileNames[profileCount]));
+        profileNames[profileCount][sizeof(profileNames[profileCount]) - 1] = '\0';
+        if (profileListStr.length() > 0)
+        {
+          profileListStr += ",";
+        }
+        profileListStr += name.substring(0, name.length() - 4);
+        profileCount++;
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+}
+
+void updateScale()
+{
+  if (!scaleConnected)
+  {
+    return;
+  }
+
+  if (!scale.isConnected())
+  {
+    scaleConnected = false;
+    flowRate = 0.0f;
+    return;
+  }
+
+  if (scale.heartbeatRequired())
+  {
+    scale.heartbeat();
+  }
+
+  if (scale.newWeightAvailable())
+  {
+    float newWeight = scale.getWeight();
+    unsigned long now = millis();
+    unsigned long dt = now - lastWeightTime;
+
+    prevWeight = currentWeight;
+    currentWeight = newWeight;
+
+    if (dt > 0 && lastWeightTime > 0)
+    {
+      flowRate = (currentWeight - prevWeight) / (dt / 1000.0f);
+    }
+
+    lastWeightTime = now;
+  }
+}
+
+void checkPendingObservation()
+{
+  if (!pendingObservation)
+  {
+    return;
+  }
+  if (millis() - pendingObsTime < 3000)
+  {
+    return;
+  }
+
+  pendingObservation = false;
+
+  float finalWeight = currentWeight;
+  float extraWeight = finalWeight - pendingWeightAtStop;
+
+  if (extraWeight < 0.0f || extraWeight > 15.0f)
+  {
+    return;
+  }
+  if (finalWeight < 5.0f)
+  {
+    return;
+  }
+
+  int slot = olsWriteIndex;
+  olsX[slot][0] = pendingFlowAtStop;
+  olsX[slot][1] = pendingPressAtStop;
+  olsY[slot] = extraWeight;
+
+  if (olsCount < OLS_WINDOW)
+  {
+    olsCount++;
+  }
+  olsWriteIndex = (olsWriteIndex + 1) % OLS_WINDOW;
+
+  fitOLS();
+  saveBeta();
+  saveObservation(pendingFlowAtStop, pendingPressAtStop, extraWeight);
+  saveBrewLog(finalWeight, pendingBrewTimeS, pendingFlowAtStop, pendingPressAtStop, extraWeight);
+}
+
 // Gets "live" Info  during brew
 void liveData()
 {
@@ -303,6 +878,12 @@ void liveData()
     // Map the pressure to wave pixels in graph
     barGraphValue = map(pressureInt, 0, 1000, 0, 164);
     myNex.writeNum("barwave.val", barGraphValue);
+
+    if (scaleConnected)
+    {
+      myNex.writeNum("weightVar.val", (int)(currentWeight * 10));
+      myNex.writeNum("flowVar.val", (int)(flowRate * 100));
+    }
   }
 }
 
@@ -332,45 +913,23 @@ float getPressure()
 
 void readSettigs()
 {
-  if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive)
+  if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive && !pendingObservation)
   {
-
-    // Just read some times
     getPressure();
-
     pressureProfilingEnabled = myNex.readNumber("pPEnabled");
     remoteProfilingEnabled = myNex.readNumber("remoteEnabled");
 
-    // Profiles
-    int temp = myNex.readNumber("t1p");
-    if (temp != t1p)
+    int idx = myNex.readNumber("selectedProfile");
+    if (sdReady && idx >= 0 && idx < profileCount && idx != selectedProfileIndex)
     {
-      t1p = temp;
-      t1pWave = map(temp, 0, 10, 0, 164);
+      selectedProfileIndex = idx;
+      if (loadProfile(profileNames[selectedProfileIndex]))
+      {
+        loadBeta();
+        loadObservations();
+        myNex.writeStr("activeProfile.txt", activeProfileName);
+      }
     }
-    temp = myNex.readNumber("t2p");
-    if (temp != t2p)
-    {
-      t2p = temp;
-      t2pWave = map(temp, 0, 10, 0, 164);
-    }
-    temp = myNex.readNumber("t3p");
-    if (temp != t3p)
-    {
-      t3p = temp;
-      t3pWave = map(temp, 0, 10, 0, 164);
-    }
-    temp = myNex.readNumber("t4p");
-    if (temp != t4p)
-    {
-      t4p = temp;
-      t4pWave = map(temp, 0, 10, 0, 164);
-    }
-
-    t1t = myNex.readNumber("t1t");
-    t2t = myNex.readNumber("t2t");
-    t3t = myNex.readNumber("t3t");
-    t4t = myNex.readNumber("t4t");
 
     readSettigsRefreshTimer = millis();
   }
@@ -464,6 +1023,19 @@ void pressureProfile()
   // Check if Brew is active and pressure Profiling is enabled
   if (brewActive && pressureProfilingEnabled)
   {
+    if (scaleConnected && targetWeight > 0.0f)
+    {
+      float predicted = predictedFinalWeight();
+      if (predicted >= targetWeight)
+      {
+        pump.setBrightness(0);
+        myNex.writeNum("n0.pco", 1535);
+        myNex.writeNum("n1.pco", 1535);
+        myNex.writeNum("setbar.val", 0);
+        return;
+      }
+    }
+
     int brewSecs = (int)((millis() - activeBrewingStart) / 1000);
 
     if (brewSecs <= t1t)
@@ -697,6 +1269,17 @@ void brewTimer(bool start)
       {
         shotCount++;
       }
+
+      float weightAtStop = currentWeight;
+      float flowAtStop = flowRate;
+      float pressAtStop = getPressure();
+
+      pendingObservation = true;
+      pendingObsTime = millis();
+      pendingFlowAtStop = flowAtStop;
+      pendingPressAtStop = pressAtStop;
+      pendingWeightAtStop = weightAtStop;
+      pendingBrewTimeS = brewSecs;
     }
     brewTimerActive = false;
   }
