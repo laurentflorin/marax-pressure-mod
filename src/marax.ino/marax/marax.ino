@@ -150,7 +150,9 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define MAX_PATH_LEN 64
 #define PROFILE_FIELD_COUNT 10
 #define PROFILE_CSV_BUFFER_LEN 128
-#define OBSERVATION_SETTLING_TIME_MS 3000
+#define WEIGHT_STABLE_WINDOW_MS 5000  // how long weight must be stable before committing observation
+#define WEIGHT_STABLE_THRESHOLD 0.2f  // max increase (g) over stability window
+#define OBSERVATION_MAX_WAIT_MS 30000 // max time to wait for stability after brew stop
 #define MIN_VALID_FINAL_WEIGHT 5.0f
 #define MAX_VALID_EXTRA_WEIGHT 15.0f
 #define OLS_SINGULARITY_THRESHOLD 1e-10
@@ -184,6 +186,8 @@ unsigned long pendingObsTime = 0;
 float pendingFlowAtStop = 0.0f;
 float pendingPressAtStop = 0.0f;
 float pendingWeightAtStop = 0.0f;
+float pendingStabilityCheckWeight = 0.0f;
+unsigned long pendingStabilityCheckTime = 0;
 int pendingBrewTimeS = 0;
 
 // nunununununununununununununununununununununununununununununun
@@ -837,8 +841,22 @@ void checkPendingObservation()
   {
     return;
   }
-  if (millis() - pendingObsTime < OBSERVATION_SETTLING_TIME_MS)
+  unsigned long now = millis();
+  if (now - pendingObsTime >= OBSERVATION_MAX_WAIT_MS)
   {
+    pendingObservation = false;
+    return;
+  }
+
+  if (now - pendingStabilityCheckTime < WEIGHT_STABLE_WINDOW_MS)
+  {
+    return;
+  }
+
+  if (currentWeight - pendingStabilityCheckWeight >= WEIGHT_STABLE_THRESHOLD)
+  {
+    pendingStabilityCheckWeight = currentWeight;
+    pendingStabilityCheckTime = now;
     return;
   }
 
@@ -1284,12 +1302,15 @@ void brewTimer(bool start)
       float weightAtStop = currentWeight;
       float flowAtStop = flowRate;
       float pressAtStop = getPressure();
+      unsigned long now = millis();
 
       pendingObservation = true;
-      pendingObsTime = millis();
+      pendingObsTime = now;
       pendingFlowAtStop = flowAtStop;
       pendingPressAtStop = pressAtStop;
       pendingWeightAtStop = weightAtStop;
+      pendingStabilityCheckWeight = weightAtStop;
+      pendingStabilityCheckTime = now;
       pendingBrewTimeS = brewSecs;
     }
     brewTimerActive = false;
