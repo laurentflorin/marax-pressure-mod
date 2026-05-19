@@ -154,6 +154,7 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define MIN_VALID_FINAL_WEIGHT 5.0f
 #define MAX_VALID_EXTRA_WEIGHT 15.0f
 #define OLS_SINGULARITY_THRESHOLD 1e-10
+#define OLS_MIN_OBSERVATIONS 3
 char activeProfileName[PROFILE_NAME_MAX_LEN] = "default";
 char activeProfileFileStem[PROFILE_NAME_MAX_LEN] = "default";
 char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
@@ -171,7 +172,8 @@ unsigned long lastWeightTime = 0;
 float flowRate = 0.0f;
 
 #define OLS_WINDOW 10
-float olsBeta[3] = {3.5f, 1.2f, 0.1f}; // β0 intercept, β1 flow, β2 pressure cold-start defaults
+const float DEFAULT_OLS_BETA[3] = {3.5f, 1.2f, 0.1f};
+float olsBeta[3] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2]}; // β0 intercept, β1 flow, β2 pressure initial defaults before model training
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
 int olsCount = 0;
@@ -390,7 +392,7 @@ float predictedFinalWeight()
 
 void fitOLS()
 {
-  if (olsCount < 3)
+  if (olsCount < OLS_MIN_OBSERVATIONS) // Need at least 3 observations to fit the 3-parameter model.
   {
     return;
   }
@@ -550,9 +552,10 @@ bool loadProfile(const char *filename)
 
 void loadBeta()
 {
-  olsBeta[0] = 3.5f;
-  olsBeta[1] = 1.2f;
-  olsBeta[2] = 0.1f;
+  for (int i = 0; i < 3; i++)
+  {
+    olsBeta[i] = DEFAULT_OLS_BETA[i];
+  }
 
   if (!sdReady)
   {
