@@ -146,9 +146,17 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 // SD / Profile globals
 #define SD_CS_PIN 4
 #define MAX_PROFILES 10
-char activeProfileName[32] = "default";
-char activeProfileFileStem[32] = "default";
-char profileNames[MAX_PROFILES][32];
+#define PROFILE_NAME_MAX_LEN 32
+#define MAX_PATH_LEN 64
+#define PROFILE_FIELD_COUNT 10
+#define PROFILE_CSV_BUFFER_LEN 128
+#define OBSERVATION_SETTLING_TIME_MS 3000
+#define MIN_VALID_FINAL_WEIGHT 5.0f
+#define MAX_VALID_EXTRA_WEIGHT 15.0f
+#define OLS_SINGULARITY_THRESHOLD 1e-10
+char activeProfileName[PROFILE_NAME_MAX_LEN] = "default";
+char activeProfileFileStem[PROFILE_NAME_MAX_LEN] = "default";
+char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
 int profileCount = 0;
 String profileListStr = "";
 int selectedProfileIndex = 0;
@@ -163,7 +171,7 @@ unsigned long lastWeightTime = 0;
 float flowRate = 0.0f;
 
 #define OLS_WINDOW 10
-float olsBeta[3] = {3.5f, 1.2f, 0.1f};
+float olsBeta[3] = {3.5f, 1.2f, 0.1f}; // β0 intercept, β1 flow, β2 pressure cold-start defaults
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
 int olsCount = 0;
@@ -431,7 +439,7 @@ void fitOLS()
       A[pivot][c] = tmp;
     }
 
-    if (fabs(A[col][col]) < 1e-10)
+    if (fabs(A[col][col]) < OLS_SINGULARITY_THRESHOLD)
     {
       return;
     }
@@ -464,7 +472,7 @@ bool loadProfile(const char *filename)
     return false;
   }
 
-  char path[64];
+  char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/profiles/%s", filename);
   File f = SD.open(path);
   if (!f)
@@ -490,7 +498,7 @@ bool loadProfile(const char *filename)
   activeProfileName[sizeof(activeProfileName) - 1] = '\0';
 
   int idx = 0;
-  char buf[128];
+  char buf[PROFILE_CSV_BUFFER_LEN];
   line.toCharArray(buf, sizeof(buf));
   char *token = strtok(buf, ",");
   while (token != NULL)
@@ -537,7 +545,7 @@ bool loadProfile(const char *filename)
     token = strtok(NULL, ",");
   }
 
-  return idx >= 10;
+  return idx >= PROFILE_FIELD_COUNT;
 }
 
 void loadBeta()
@@ -551,7 +559,7 @@ void loadBeta()
     return;
   }
 
-  char path[64];
+  char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
   File f = SD.open(path);
   if (!f)
@@ -576,7 +584,7 @@ void saveBeta()
     return;
   }
 
-  char path[64];
+  char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
   SD.remove(path);
   File f = SD.open(path, FILE_WRITE);
@@ -602,7 +610,7 @@ void loadObservations()
     return;
   }
 
-  char path[64];
+  char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
   File f = SD.open(path);
   if (!f)
@@ -641,7 +649,7 @@ void loadObservations()
       continue;
     }
 
-    char buf[64];
+    char buf[PROFILE_CSV_BUFFER_LEN];
     line.toCharArray(buf, sizeof(buf));
     char *tok = strtok(buf, ",");
     int col = 0;
@@ -681,7 +689,7 @@ void saveObservation(float flow, float pres, float extra)
     return;
   }
 
-  char path[64];
+  char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
   bool exists = SD.exists(path);
   File f = SD.open(path, FILE_WRITE);
@@ -826,7 +834,7 @@ void checkPendingObservation()
   {
     return;
   }
-  if (millis() - pendingObsTime < 3000)
+  if (millis() - pendingObsTime < OBSERVATION_SETTLING_TIME_MS)
   {
     return;
   }
@@ -836,11 +844,11 @@ void checkPendingObservation()
   float finalWeight = currentWeight;
   float extraWeight = finalWeight - pendingWeightAtStop;
 
-  if (extraWeight < 0.0f || extraWeight > 15.0f)
+  if (extraWeight < 0.0f || extraWeight > MAX_VALID_EXTRA_WEIGHT)
   {
     return;
   }
-  if (finalWeight < 5.0f)
+  if (finalWeight < MIN_VALID_FINAL_WEIGHT)
   {
     return;
   }
