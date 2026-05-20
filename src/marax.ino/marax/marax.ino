@@ -388,10 +388,9 @@ char *toCharArray(String str)
   return &str[0];
 }
 
-float predictedFinalWeight()
+float predictedFinalWeight(float pressure)
 {
-  float p = getPressure();
-  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * p;
+  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * pressure;
 }
 
 void fitOLS()
