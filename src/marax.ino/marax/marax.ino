@@ -949,7 +949,8 @@ void readSettigs()
     remoteProfilingEnabled = myNex.readNumber("remoteEnabled");
 
     int idx = myNex.readNumber("selectedProfile");
-    if (sdReady && idx >= 0 && idx < profileCount && idx != selectedProfileIndex)
+    bool usePresetProfile = sdReady && idx >= 0 && idx < profileCount;
+    if (usePresetProfile && idx != selectedProfileIndex)
     {
       selectedProfileIndex = idx;
       if (loadProfile(profileNames[selectedProfileIndex]))
@@ -958,6 +959,38 @@ void readSettigs()
         loadObservations();
         myNex.writeStr("activeProfile.txt", activeProfileName);
       }
+    }
+    else if (!usePresetProfile)
+    {
+      int temp = myNex.readNumber("t1p");
+      if (temp != t1p)
+      {
+        t1p = temp;
+        t1pWave = map(temp, 0, 10, 0, 164);
+      }
+      temp = myNex.readNumber("t2p");
+      if (temp != t2p)
+      {
+        t2p = temp;
+        t2pWave = map(temp, 0, 10, 0, 164);
+      }
+      temp = myNex.readNumber("t3p");
+      if (temp != t3p)
+      {
+        t3p = temp;
+        t3pWave = map(temp, 0, 10, 0, 164);
+      }
+      temp = myNex.readNumber("t4p");
+      if (temp != t4p)
+      {
+        t4p = temp;
+        t4pWave = map(temp, 0, 10, 0, 164);
+      }
+
+      t1t = myNex.readNumber("t1t");
+      t2t = myNex.readNumber("t2t");
+      t3t = myNex.readNumber("t3t");
+      t4t = myNex.readNumber("t4t");
     }
 
     readSettigsRefreshTimer = millis();
