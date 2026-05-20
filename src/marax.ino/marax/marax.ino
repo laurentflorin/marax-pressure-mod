@@ -1304,14 +1304,21 @@ void brewTimer(bool start)
       float pressAtStop = getPressure();
       unsigned long now = millis();
 
-      pendingObservation = true;
-      pendingObsTime = now;
-      pendingFlowAtStop = flowAtStop;
-      pendingPressAtStop = pressAtStop;
-      pendingWeightAtStop = weightAtStop;
-      pendingStabilityCheckWeight = weightAtStop;
-      pendingStabilityCheckTime = now;
-      pendingBrewTimeS = brewSecs;
+      if (scaleConnected && lastWeightTime > 0)
+      {
+        pendingObservation = true;
+        pendingObsTime = now;
+        pendingFlowAtStop = flowAtStop;
+        pendingPressAtStop = pressAtStop;
+        pendingWeightAtStop = weightAtStop;
+        pendingStabilityCheckWeight = weightAtStop;
+        pendingStabilityCheckTime = now;
+        pendingBrewTimeS = brewSecs;
+      }
+      else
+      {
+        pendingObservation = false;
+      }
     }
     brewTimerActive = false;
   }
