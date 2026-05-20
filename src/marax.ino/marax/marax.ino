@@ -626,27 +626,14 @@ void loadObservations()
 
   f.readStringUntil('\n');
 
-  int lineCount = 0;
+  // Single-pass ring buffer: reads CSV sequentially, maintaining only the last
+  // OLS_WINDOW rows in circular buffers (rbX0, rbX1, rbY). rbHead wraps around
+  // via modulo arithmetic; rbCount tracks total rows stored (capped at OLS_WINDOW).
+  float rbX0[OLS_WINDOW], rbX1[OLS_WINDOW], rbY[OLS_WINDOW];
+  int rbHead = 0;
+  int rbCount = 0;
+
   while (f.available())
-  {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0)
-    {
-      lineCount++;
-    }
-  }
-
-  f.seek(0);
-  f.readStringUntil('\n');
-
-  int skip = max(0, lineCount - OLS_WINDOW);
-  for (int i = 0; i < skip; i++)
-  {
-    f.readStringUntil('\n');
-  }
-
-  while (f.available() && olsCount < OLS_WINDOW)
   {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -659,31 +646,41 @@ void loadObservations()
     line.toCharArray(buf, sizeof(buf));
     char *tok = strtok(buf, ",");
     int col = 0;
+    float vals[3];
     while (tok != NULL && col < 3)
     {
-      if (col == 0)
-      {
-        olsX[olsCount][0] = atof(tok);
-      }
-      else if (col == 1)
-      {
-        olsX[olsCount][1] = atof(tok);
-      }
-      else if (col == 2)
-      {
-        olsY[olsCount] = atof(tok);
-      }
+      vals[col] = atof(tok);
       tok = strtok(NULL, ",");
       col++;
     }
 
     if (col == 3)
     {
-      olsCount++;
+      rbX0[rbHead] = vals[0];
+      rbX1[rbHead] = vals[1];
+      rbY[rbHead] = vals[2];
+      rbHead = (rbHead + 1) % OLS_WINDOW;
+      if (rbCount < OLS_WINDOW)
+      {
+        rbCount++;
+      }
     }
   }
 
   f.close();
+
+  // Copy ring buffer into OLS arrays in chronological order
+  // If buffer not yet full, oldest entry is at index 0; otherwise it is at rbHead.
+  int start = (rbCount < OLS_WINDOW) ? 0 : rbHead;
+  for (int i = 0; i < rbCount; i++)
+  {
+    int idx = (start + i) % OLS_WINDOW;
+    olsX[i][0] = rbX0[idx];
+    olsX[i][1] = rbX1[idx];
+    olsY[i] = rbY[idx];
+  }
+
+  olsCount = rbCount;
   olsWriteIndex = olsCount % OLS_WINDOW;
   fitOLS();
 }
