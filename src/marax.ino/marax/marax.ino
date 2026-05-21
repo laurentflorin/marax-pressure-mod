@@ -914,27 +914,30 @@ void liveData()
 
 float getPressure()
 {
-  // returns sensor pressure data
-  // set up voltage divider
-  //  3.3V/1024
-  //  voltageZero = 0.3V
-  //  voltageMax = 3V 940 Max
-  //  pressure gauge range 0-12 bar
+  // Sensor:
+  //  - Supply: 5V
+  //  - Output: 0.4V to 2.4V
+  //  - Range: 0 to 1.2 MPa ~= 0 to 12 bar
+  //
+  // Nano 33 IoT ADC:
+  //  - 3.3V reference
+  //  - analogRead() range 0..1023 in this codebase
+  
+  const float sensorMinV = 0.4f;
+  const float sensorMaxV = 2.4f;
+  const float sensorMaxBar = 12.0f;
 
-  sensorVal = (float)analogRead(A1);                                 // Read pressure sensor val (AA)
-  filteredVal = (alpha * filteredVal) + ((1.0 - alpha) * sensorVal); // Low Pass Filter
-  voltage = (filteredVal / 1024.0) * 3.3;                            // calculate voltage
-  float Pressure = (voltage - 0.3) / 0.212;
+  sensorVal = (float)analogRead(A1);
+  filteredVal = (alpha * filteredVal) + ((1.0 - alpha) * sensorVal);
+  voltage = (filteredVal / 1024.0f) * 3.3f;
 
-  if (Pressure < 0)
-  {
-    return 0;
-  }
-  else
-  {
-    return Pressure;
-  }
+  float Pressure = (voltage - sensorMinV) * sensorMaxBar / (sensorMaxV - sensorMinV);
+
+  if (Pressure < 0.0f) return 0.0f;
+  if (Pressure > sensorMaxBar) return sensorMaxBar;
+  return Pressure;
 }
+
 
 void readSettigs()
 {
