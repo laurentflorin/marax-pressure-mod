@@ -1,6 +1,6 @@
 # LELIT MaraX Pressure Mod with brew by weight
 
-This mode is a fork of [marax-pressure-mod](https://github.com/larszi/marax-pressure-mod). It is adapted for the MaraX V2 and includes brew by weight using the Felicita Arc.
+This mod is a fork of [marax-pressure-mod](https://github.com/larszi/marax-pressure-mod). It is adapted for the MaraX V2 and includes brew by weight using the Felicita Arc.
 
 ## Implemented Extension
 - Using [the guide of m1n1.de](https://www.m1n1.de/en/lelit-mara-x-v2-gicar-internals) the wirering from the Gicar to the Arduino was adapted (see wireing diagram)
