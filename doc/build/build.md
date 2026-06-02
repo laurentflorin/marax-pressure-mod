@@ -10,19 +10,15 @@
 
 ### Marax GiCard MCU
 
-![MCU](/assets/mcu_marax.jpg)
-
-Pinout of the MCU of the MaraX(GiCar) from center to edge
-| Vcc | Gnd | RX | TX | RTS | CT |
-
+A detailed overview of the GiCard unit of the MaraX V2 is availabe here: [the guide of m1n1.de](https://www.m1n1.de/en/lelit-mara-x-v2-gicar-internals)
 
 ## Build Information
 ```
 Do not take this as a build guide, just a documentation of this mod!
 ```
 
-This is the overall circuit of the mod. The Nano was soldered to PCB with some plugs for each components. 
-![TWiring](/assets/circuit.svg)
+This is the overall circuit of the mod. I did not solder anything. I use a breakout board on the Nano to securely fit cables to it. I use some Dupont connectors in other parts as well as Wecko connectors and crimp connectors. 
+![TWiring](/assets/wiring_diagram.pdf)
 
 ## Pressure Sensor
 
@@ -51,33 +47,3 @@ The AC dimmer will always allow 100% of the power to the pump if no brew is acti
 ![Brewswitch](/assets/brew_switch_wires.jpg)
 I have connected the Nano to the original brew switch, this way the Nano can detect if a brew is active. I have used a relay to still "switch" the brew switch for the MCU of the Marax. This way the MCU of the Marax still thinks is stock and will also know if a brew is active and heat the boiler accordingly 
 > Note, the MCU of the Marax will switch ground over this switch!
-
-
-# The good the bad and the ugly
-
-### good 
- - fun to play around with 
- - really good espresso 
- - learned a lot about the machine 
- - learned a lot about embedded systems and electrics
- - The touch screen makes the machine look way more modern
- - the readout of the temps over mqtt is really nice
-  
-### the bad
-- As I am not an really no expert when it comes to embedded systems I choose to go with an arduino step to quickly prototype if this project would work. However there are definitely some drawbacks. I would now choose a STM controller and a proper development environment, with a CI, package management etc.. and maybe even develop my own pcb with all the components needed. But this would have taken me even more time to finish this project and I don't have a backup espresso machine.. 
-- The Code of the mod is ... lets just say it involved..  
-- As you can see in the diagram the 5v rail of the Nano is used for the power of the lcd, this is **not** best practice and will reduce the live time of the Nano. However it has been working great so far.  
-
-### the ugly
-- I have mounted most of the components at the back of the machine inside small electrical boxes, even if you cant see them I really think this can be improved in the feature. Lelit has build a compact machine so I think a custom pcb is needed to keep everything inside. 
-
-
-## Modding other Machines
-I have revived some messages asking about this mod for other machines. Technically this is possible with every machine that has a vibration pump.
- However:
-- the brew switch will be different
-- the hosing used after the pump will be different
-- you will not be able to use the temperature read outs.
-  
-
-
