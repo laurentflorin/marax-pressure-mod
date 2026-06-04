@@ -17,7 +17,7 @@ A detailed overview of the GiCard unit of the MaraX V2 is availabe here: [the gu
 Do not take this as a build guide, just a documentation of this mod!
 ```
 
-This is the overall circuit of the mod. I did not solder anything. I use a breakout board on the Nano to securely fit cables to it. I use some Dupont connectors in other parts as well as Wecko connectors and crimp connectors. 
+This is the overall circuit of the mod. I did not solder anything. I use a breakout board on the Nano to securely fit cables to it. I use some Dupont connectors in other parts as well as Wago connectors and crimp connectors. 
 ![TWiring](/assets/wiring_diagram.pdf)
 
 ## Pressure Sensor
