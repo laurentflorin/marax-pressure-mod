@@ -288,7 +288,9 @@ void setup()
     }
 
     myNex.writeStr("profileList.txt", profileListStr.c_str());
-    myNex.writeStr("activeProfile.txt", activeProfileName);
+    myNex.writeStr("actProftxt", activeProfileName);
+    updateProfileSelectUi();
+    updateProfileModeText();
   }
 
   scaleConnected = scale.init();
@@ -744,6 +746,33 @@ void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float
   f.close();
 }
 
+void updateProfileSelectUi()
+{
+  int maxIndex = (profileCount > 0) ? profileCount - 1 : 0;
+  int currentIndex = (selectedProfileIndex < 0) ? 0 : selectedProfileIndex;
+  if (currentIndex >= profileCount)
+    currentIndex = maxIndex;
+
+  myNex.writeNum("profileMax", maxIndex);
+  myNex.writeNum("selectedProfile", currentIndex);
+}
+
+void updateProfileModeText()
+{
+  if (pressureProfilingEnabled && remoteProfilingEnabled && sdReady)
+  {
+    myNex.writeStr("profileModeTxt", activeProfileName);
+  }
+  else if (pressureProfilingEnabled)
+  {
+    myNex.writeStr("profileModeTxt", "Manual");
+  }
+  else
+  {
+    myNex.writeStr("profileModeTxt", "None");
+  }
+}
+
 void scanProfiles()
 {
   profileCount = 0;
@@ -943,12 +972,27 @@ void readSettigs()
 {
   if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive && !pendingObservation)
   {
+    int previousProfileCount = profileCount;
+    if (sdReady)
+    {
+      scanProfiles();
+      if (previousProfileCount != profileCount)
+      {
+        updateProfileSelectUi();
+      }
+    }
+
     getPressure();
     pressureProfilingEnabled = myNex.readNumber("pPEnabled");
     remoteProfilingEnabled = myNex.readNumber("remoteEnabled");
 
     int idx = myNex.readNumber("selectedProfile");
-    bool usePresetProfile = sdReady && idx >= 0 && idx < profileCount;
+    if (idx < 0)
+      idx = 0;
+    if (idx >= profileCount)
+      idx = profileCount - 1;
+
+    bool usePresetProfile = pressureProfilingEnabled && remoteProfilingEnabled && sdReady && idx >= 0 && idx < profileCount;
     if (usePresetProfile && idx != selectedProfileIndex)
     {
       selectedProfileIndex = idx;
@@ -956,10 +1000,10 @@ void readSettigs()
       {
         loadBeta();
         loadObservations();
-        myNex.writeStr("activeProfile.txt", activeProfileName);
+        myNex.writeStr("actProftxt", activeProfileName);
       }
     }
-    else if (!usePresetProfile)
+    else if (!usePresetProfile && pressureProfilingEnabled)
     {
       int temp = myNex.readNumber("t1p");
       if (temp != t1p)
@@ -990,8 +1034,16 @@ void readSettigs()
       t2t = myNex.readNumber("t2t");
       t3t = myNex.readNumber("t3t");
       t4t = myNex.readNumber("t4t");
+
+      // Manual profile mode also lets the user choose the target weight.
+      int manualTargetWeight = myNex.readNumber("targetWeight");
+      if (manualTargetWeight >= 0 && manualTargetWeight != (int)targetWeight)
+      {
+        targetWeight = (float)manualTargetWeight;
+      }
     }
 
+    updateProfileModeText();
     readSettigsRefreshTimer = millis();
   }
 }
@@ -1016,6 +1068,7 @@ void updateDisplay()
     // Send global vars always
     myNex.writeNum("brewTemp", brewTemp);
     myNex.writeNum("steamTemp", steamTemp);
+    myNex.writeNum("targetWeight", (int)targetWeight);
 
     currentPageId = myNex.readNumber("dp");
 
@@ -1081,7 +1134,10 @@ void setPressure(float targetValue)
 
 void pressureProfile()
 {
-  // Check if Brew is active and pressure Profiling is enabled
+  // Run pressure profiling whenever either local or remote pressure profiling is enabled.
+  // The source of the profile values is selected in readSettigs():
+  // - remoteProfilingEnabled => SD profile values from selectedProfile
+  // - pressureProfilingEnabled => manual values from the display
   if (brewActive && pressureProfilingEnabled)
   {
     if (scaleConnected && targetWeight > 0.0f)
@@ -1134,11 +1190,10 @@ void pressureProfile()
       pump.setBrightness(0);
     }
   }
-  // Remote Profil
-  if (brewActive && remoteProfilingEnabled)
-  {
-    // TODO: This will be implement later
-  }
+  // The actual pressure profile values are already selected in readSettigs():
+  // - remoteProfilingEnabled => SD profile values from selectedProfile
+  // - pressureProfilingEnabled => manual values from the display
+  // When both flags are false, this branch is skipped entirely.
 }
 
 void brewDetect()
