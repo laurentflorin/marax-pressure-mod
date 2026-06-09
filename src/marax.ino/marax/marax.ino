@@ -172,6 +172,9 @@ float currentWeight = 0.0f;
 float prevWeight = 0.0f;
 unsigned long lastWeightTime = 0;
 float flowRate = 0.0f;
+int lastScaleConnectedUi = -1; // -1 forces first UI update
+unsigned long lastScaleReconnectAttemptMs = 0;
+const unsigned long SCALE_RECONNECT_INTERVAL_MS = 5000;
 
 #define OLS_WINDOW 10
 const float DEFAULT_OLS_BETA[3] = {3.5f, 1.2f, 0.1f};
@@ -294,6 +297,8 @@ void setup()
   }
 
   scaleConnected = scale.init();
+  updateScaleConnectionUi();
+  lastScaleReconnectAttemptMs = millis();
 }
 
 // nunununununununununununununununununununununununununununununun
@@ -302,6 +307,7 @@ void setup()
 void loop()
 {
   updateScale();
+  tryReconnectScale();
   checkPendingObservation();
 
   if (!mqttClient.connected())
@@ -773,6 +779,38 @@ void updateProfileModeText()
   }
 }
 
+void updateScaleConnectionUi()
+{
+  int connected = scaleConnected ? 1 : 0;
+  if (connected != lastScaleConnectedUi)
+  {
+    myNex.writeNum("scaleConnected", connected);
+    lastScaleConnectedUi = connected;
+  }
+}
+
+void tryReconnectScale()
+{
+  if (scaleConnected)
+  {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastScaleReconnectAttemptMs < SCALE_RECONNECT_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastScaleReconnectAttemptMs = now;
+  scaleConnected = scale.init();
+  if (!scaleConnected)
+  {
+    flowRate = 0.0f;
+  }
+  updateScaleConnectionUi();
+}
+
 void scanProfiles()
 {
   profileCount = 0;
@@ -834,6 +872,7 @@ void updateScale()
   {
     scaleConnected = false;
     flowRate = 0.0f;
+    updateScaleConnectionUi();
     return;
   }
 
@@ -1069,6 +1108,7 @@ void updateDisplay()
     myNex.writeNum("brewTemp", brewTemp);
     myNex.writeNum("steamTemp", steamTemp);
     myNex.writeNum("targetWeight", (int)targetWeight);
+    updateScaleConnectionUi();
 
     currentPageId = myNex.readNumber("dp");
 
