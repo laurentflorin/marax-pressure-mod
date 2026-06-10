@@ -20,11 +20,12 @@
 #include <AcaiaArduinoBLE.h>
 
 // nunununununununununununununununununununununununununununununun
-// nunununununununununununu Wifi
+// nunununununununununununu Wifi and Bluetooth
 // nunununununununununununununununununununununununununununununun
 // Define MQTT / WIFI
 #define wifi_ssid ""
 #define wifi_password ""
+#define SCALE_MAC_ADDRESS "XX:XX:XX:XX:XX:XX"  // e.g., "A4:C1:38:12:34:56"
 
 WiFiClient wifiClient;
 bool wifiConnected = false;
@@ -167,7 +168,7 @@ float targetWeight = 36.0f;
 bool sdReady = false;
 
 AcaiaArduinoBLE scale(false);
-bool scaleConnected = false;
+bool nected = false;
 float currentWeight = 0.0f;
 float prevWeight = 0.0f;
 unsigned long lastWeightTime = 0;
@@ -296,7 +297,7 @@ void setup()
     updateProfileModeText();
   }
 
-  scaleConnected = scale.init();
+  scaleConnected = scale.init(SCALE_MAC_ADDRESS);
   updateScaleConnectionUi();
   lastScaleReconnectAttemptMs = millis();
 }
@@ -805,7 +806,7 @@ void tryReconnectScale()
   }
 
   lastScaleReconnectAttemptMs = now;
-  scaleConnected = scale.init();
+  scaleConnected = scale.init(SCALE_MAC_ADDRESS);
   if (!scaleConnected)
   {
     flowRate = 0.0f;
