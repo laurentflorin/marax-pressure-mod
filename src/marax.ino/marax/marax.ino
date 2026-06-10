@@ -177,8 +177,8 @@ unsigned long lastScaleReconnectAttemptMs = 0;
 const unsigned long SCALE_RECONNECT_INTERVAL_MS = 5000;
 
 #define OLS_WINDOW 10
-const float DEFAULT_OLS_BETA[3] = {3.5f, 1.2f, 0.1f};
-float olsBeta[3] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2]}; // Initial OLS coefficients: β0 intercept, β1 flow-rate coefficient, β2 pressure coefficient.
+const float DEFAULT_OLS_BETA[5] = {3.5f, 1.2f, 0.1f, 0.0f, 0.0f};
+float olsBeta[5] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2], DEFAULT_OLS_BETA[3], DEFAULT_OLS_BETA[4]}; // Initial OLS coefficients: β0 intercept, β1 flow-rate, β2 pressure, β3 flow*pressure interaction, β4 pressure^2.
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
 int olsCount = 0;
@@ -398,7 +398,7 @@ char *toCharArray(String str)
 
 float predictedFinalWeight(float pressure)
 {
-  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * pressure;
+  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * pressure + olsBeta[3] * flowRate * pressure + olsBeta[4] * pressure * pressure;
 }
 
 void fitOLS()
@@ -408,36 +408,38 @@ void fitOLS()
     return;
   }
 
-  double XtX[3][3] = {};
-  double Xty[3] = {};
+  double XtX[5][5] = {};
+  double Xty[5] = {};
 
   for (int i = 0; i < olsCount; i++)
   {
-    double row[3] = {1.0, (double)olsX[i][0], (double)olsX[i][1]};
-    for (int r = 0; r < 3; r++)
+    double flow = (double)olsX[i][0];
+    double pressure = (double)olsX[i][1];
+    double row[5] = {1.0, flow, pressure, flow * pressure, pressure * pressure};
+    for (int r = 0; r < 5; r++)
     {
       Xty[r] += row[r] * olsY[i];
-      for (int c = 0; c < 3; c++)
+      for (int c = 0; c < 5; c++)
       {
         XtX[r][c] += row[r] * row[c];
       }
     }
   }
 
-  double A[3][4];
-  for (int r = 0; r < 3; r++)
+  double A[5][6];
+  for (int r = 0; r < 5; r++)
   {
-    for (int c = 0; c < 3; c++)
+    for (int c = 0; c < 5; c++)
     {
       A[r][c] = XtX[r][c];
     }
-    A[r][3] = Xty[r];
+    A[r][5] = Xty[r];
   }
 
-  for (int col = 0; col < 3; col++)
+  for (int col = 0; col < 5; col++)
   {
     int pivot = col;
-    for (int row = col + 1; row < 3; row++)
+    for (int row = col + 1; row < 5; row++)
     {
       if (fabs(A[row][col]) > fabs(A[pivot][col]))
       {
@@ -445,7 +447,7 @@ void fitOLS()
       }
     }
 
-    for (int c = 0; c <= 3; c++)
+    for (int c = 0; c <= 5; c++)
     {
       double tmp = A[col][c];
       A[col][c] = A[pivot][c];
@@ -457,7 +459,7 @@ void fitOLS()
       return;
     }
 
-    for (int row = 0; row < 3; row++)
+    for (int row = 0; row < 5; row++)
     {
       if (row == col)
       {
@@ -465,16 +467,16 @@ void fitOLS()
       }
 
       double factor = A[row][col] / A[col][col];
-      for (int c = col; c <= 3; c++)
+      for (int c = col; c <= 5; c++)
       {
         A[row][c] -= factor * A[col][c];
       }
     }
   }
 
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 5; i++)
   {
-    olsBeta[i] = (float)(A[i][3] / A[i][i]);
+    olsBeta[i] = (float)(A[i][5] / A[i][i]);
   }
 }
 
@@ -563,7 +565,7 @@ bool loadProfile(const char *filename)
 
 void loadBeta()
 {
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 5; i++)
   {
     olsBeta[i] = DEFAULT_OLS_BETA[i];
   }
@@ -581,7 +583,7 @@ void loadBeta()
     return;
   }
 
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 5; i++)
   {
     if (f.available())
     {
@@ -607,7 +609,7 @@ void saveBeta()
     return;
   }
 
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 5; i++)
   {
     f.println(olsBeta[i], 6);
   }
