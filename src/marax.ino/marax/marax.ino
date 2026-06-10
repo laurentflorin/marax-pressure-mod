@@ -1112,7 +1112,7 @@ void updateDisplay()
 
     currentPageId = myNex.readNumber("dp");
 
-    // Save Settings im Page changes
+    // Save Settings in Page changes
     // Refresh Pages that only need one time refresh
     if (currentPageId != lastPageId)
     {
@@ -1138,7 +1138,7 @@ void updateDisplay()
     }
 
     // Cleaing Mode Settings
-    if (currentPageId == 4278190085 || currentPageId == 5)
+    if (currentPageId == 4278190086 || currentPageId == 6)
     {
       cleaningModeActive = true;
     }
