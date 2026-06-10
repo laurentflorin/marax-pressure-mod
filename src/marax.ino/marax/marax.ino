@@ -156,7 +156,7 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define MIN_VALID_FINAL_WEIGHT 5.0f
 #define MAX_VALID_EXTRA_WEIGHT 15.0f
 #define OLS_SINGULARITY_THRESHOLD 1e-10
-#define OLS_MIN_OBSERVATIONS 3
+#define OLS_MIN_OBSERVATIONS 5
 char activeProfileName[PROFILE_NAME_MAX_LEN] = "default";
 char activeProfileFileStem[PROFILE_NAME_MAX_LEN] = "default";
 char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
@@ -176,8 +176,8 @@ int lastScaleConnectedUi = -1; // -1 forces first UI update
 unsigned long lastScaleReconnectAttemptMs = 0;
 const unsigned long SCALE_RECONNECT_INTERVAL_MS = 5000;
 
-#define OLS_WINDOW 10
-const float DEFAULT_OLS_BETA[5] = {3.5f, 1.2f, 0.1f, 0.0f, 0.0f};
+#define OLS_WINDOW 30
+const float DEFAULT_OLS_BETA[5] = {3.5f, 1.2f, 0.1f, 0.1f, 0.1f};
 float olsBeta[5] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2], DEFAULT_OLS_BETA[3], DEFAULT_OLS_BETA[4]}; // Initial OLS coefficients: β0 intercept, β1 flow-rate, β2 pressure, β3 flow*pressure interaction, β4 pressure^2.
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
