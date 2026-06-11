@@ -29,7 +29,7 @@
 
 WiFiClient wifiClient;
 bool wifiConnected = false;
-
+bool scaleConnected = false;
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu Timers
 // nunununununununununununununununununununununununununununununun
@@ -397,9 +397,9 @@ char *toCharArray(String str)
   return &str[0];
 }
 
-float predictedFinalWeight(float pressure)
+float predictedFinalWeight(float flow, float pressure)
 {
-  return currentWeight + olsBeta[0] + olsBeta[1] * flowRate + olsBeta[2] * pressure + olsBeta[3] * flowRate * pressure + olsBeta[4] * pressure * pressure;
+  return currentWeight + olsBeta[0] + olsBeta[1] * flow + olsBeta[2] * pressure + olsBeta[3] * flow * pressure + olsBeta[4] * pressure * pressure;
 }
 
 void fitOLS()
@@ -1185,7 +1185,7 @@ void pressureProfile()
   {
     if (scaleConnected && targetWeight > 0.0f)
     {
-      float predicted = predictedFinalWeight();
+      float predicted = predictedFinalWeight(flowRate, getPressure());
       if (predicted >= targetWeight)
       {
         pump.setBrightness(0);
