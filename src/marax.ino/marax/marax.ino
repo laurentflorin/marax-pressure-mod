@@ -39,6 +39,10 @@ long readSettigsRefreshTimer = millis();
 unsigned long pageRefreshTimer = millis();
 unsigned long refresh_timer = millis();
 unsigned long activeBrewingStart = millis();
+unsigned long lastWifiReconnectAttemptMs = 0;
+unsigned long lastMqttReconnectAttemptMs = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000;  // Try every 10 seconds
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;   // Try every 5 seconds
 
 bool POWER_ON = false;
 
@@ -250,15 +254,24 @@ void setup()
   }
   WiFi.setHostname("MaraXController");
 
+  // Non-blocking WiFi connection - try once, continue regardless
   WiFi.begin(wifi_ssid, wifi_password);
-  while (WiFi.status() != WL_CONNECTED)
+  unsigned long wifiStartTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStartTime < 10000))
   {
-    // Serial.println("Debug: NO d WIFI");
     delay(500);
-    // Serial.print(".");
-    WiFi.begin(wifi_ssid, wifi_password);
   }
-  delay(2000);
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    wifiConnected = true;
+  }
+  else
+  {
+    wifiConnected = false;
+  }
+
+  lastWifiReconnectAttemptMs = millis();
 
   // SD card init
   if (SD.begin(SD_CS_PIN))
@@ -309,13 +322,14 @@ void loop()
 {
   updateScale();
   tryReconnectScale();
+  tryReconnectWifi();
+  tryReconnectMqtt();
   checkPendingObservation();
 
-  if (!mqttClient.connected())
+  if (mqttClient.connected())
   {
-    reconnect();
+    mqttClient.loop();
   }
-  mqttClient.loop();
   myNex.NextionListen();
 
   getMaschineInput();
@@ -330,20 +344,7 @@ void loop()
 }
 void reconnect()
 {
-  // Loop until we're reconnected
-  while (!mqttClient.connected())
-  {
-    // Attempt to connect
-    if (mqttClient.connect("MaraXMod", mqtt_user, mqtt_password))
-    {
-      mqttClient.subscribe("marax/remoteProfile");
-    }
-    else
-    {
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
+  // This function is no longer used - replaced by tryReconnectMqtt()
 }
 void callbackfun(char *topic, byte *payload, unsigned int length)
 {
@@ -812,6 +813,53 @@ void tryReconnectScale()
     flowRate = 0.0f;
   }
   updateScaleConnectionUi();
+}
+
+void tryReconnectWifi()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    wifiConnected = true;
+    return; // Already connected
+  }
+
+  wifiConnected = false;
+
+  unsigned long now = millis();
+  if (now - lastWifiReconnectAttemptMs < WIFI_RECONNECT_INTERVAL_MS)
+  {
+    return; // Too soon to retry
+  }
+
+  lastWifiReconnectAttemptMs = now;
+  WiFi.begin(wifi_ssid, wifi_password);
+}
+
+void tryReconnectMqtt()
+{
+  if (mqttClient.connected())
+  {
+    return; // Already connected
+  }
+
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED)
+  {
+    return; // Can't connect to MQTT without WiFi
+  }
+
+  unsigned long now = millis();
+  if (now - lastMqttReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS)
+  {
+    return; // Too soon to retry
+  }
+
+  lastMqttReconnectAttemptMs = now;
+
+  // Single non-blocking connection attempt
+  if (mqttClient.connect("MaraXMod", mqtt_user, mqtt_password))
+  {
+    mqttClient.subscribe("marax/remoteProfile");
+  }
 }
 
 void scanProfiles()
