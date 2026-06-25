@@ -1,19 +1,45 @@
 #include <Arduino.h>
 #include <EasyNextionLibrary.h>
+
+// DISABLE WiFi to prevent radio conflicts with BLE
+// ESP32-S3 has only ONE 2.4GHz radio shared between WiFi and BLE
+// Disabling WiFi gives BLE full control for reliable scale connection
+#define DISABLE_WIFI_MQTT
+
+// ─────────────────────────────────────────────────────────────────────────
+// OTA (Over-The-Air firmware updates over WiFi)
+// Comment out ENABLE_OTA to build without OTA.
+//
+// WARNING: OTA requires WiFi. The ESP32-S3 shares ONE 2.4GHz radio between
+// WiFi and BLE, so bringing WiFi up for OTA can reduce BLE scale reliability
+// (this is the very reason DISABLE_WIFI_MQTT exists). The OTA code here is
+// non-blocking and never stalls normal operation. Set wifi_ssid /
+// wifi_password (below) before using OTA.
+// Flashing: Arduino IDE → Tools → Port → network port "MaraXController at <ip>".
+// ─────────────────────────────────────────────────────────────────────────
+#define ENABLE_OTA
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <SD.h>
 #include <SPI.h>
 #include <driver/uart.h>
-#include <AcaiaArduinoBLE.h>
+#include <NimBLEDevice.h>
+#include "FelicitaScale_NimBLE.h"
+
+#ifdef ENABLE_OTA
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#endif
 
 // === Required Libraries ===
 // - EasyNextionLibrary     (Arduino Library Manager)
 // - WiFi                   (built-in with ESP32 Arduino core)
 // - PubSubClient           (Arduino Library Manager)
 // - SD                     (Arduino built-in)
-// - ArduinoBLE             (Arduino Library Manager)
-// - AcaiaArduinoBLE        (manual install: https://github.com/baettigp/Acaia_Felicita_ArduinoBLE)
+// - NimBLE-Arduino         (Arduino Library Manager) - REQUIRED for ESP32-S3 BLE
+// NOTE: ArduinoBLE and AcaiaArduinoBLE are NOT compatible with ESP32-S3!
+//       Using NimBLE-based implementation instead (FelicitaScale_NimBLE.h)
 //
 // Arduino IDE board: "ESP32S3 Dev Module"
 //   Board package:   esp32 by Espressif Systems (Boards Manager)
@@ -37,7 +63,7 @@
 //   GPIO17  → MaraX RX   (UART1 TX)
 //   GPIO18  ← Nextion TX (UART2 RX)
 //   GPIO8   → Nextion RX (UART2 TX)
-//   GPIO1   ← Pressure sensor output (ADC1_CH0)
+//   GPIO3   ← Pressure sensor output (ADC1_CH2)
 //              IMPORTANT: Must use ADC1 (GPIO1–10). ADC2 (GPIO11–20)
 //              cannot be used for analog reads when WiFi is active!
 //   GPIO4   ← AC mains zero-cross detection (sync for dimmable_light)
@@ -65,7 +91,7 @@
 #define MARAX_TX_PIN         17
 #define NEXTION_RX_PIN       18
 #define NEXTION_TX_PIN        8
-#define PRESSURE_SENSOR_PIN   1   // ADC1_CH0 — safe to use with WiFi
+#define PRESSURE_SENSOR_PIN   3   // ADC1_CH2 — safe to use with WiFi
 #define AC_ZERO_CROSS_PIN     4
 #define PUMP_PIN              5
 #define BREW_SWITCH_PIN       6
@@ -224,15 +250,14 @@ int selectedProfileIndex = 0;
 float targetWeight = 36.0f;
 bool sdReady = false;
 
-AcaiaArduinoBLE scale(false);
-bool nected = false;
+FelicitaScale_NimBLE scale(false);  // true = enable debug to see BLE scan results
 float currentWeight = 0.0f;
 float prevWeight = 0.0f;
 unsigned long lastWeightTime = 0;
 float flowRate = 0.0f;
 int lastScaleConnectedUi = -1; // -1 forces first UI update
 unsigned long lastScaleReconnectAttemptMs = 0;
-const unsigned long SCALE_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long SCALE_RECONNECT_INTERVAL_MS = 30000;  // 30 seconds between scan attempts
 
 #define OLS_WINDOW 30
 const float DEFAULT_OLS_BETA[5] = {3.5f, 1.2f, 0.1f, 0.1f, 0.1f};
@@ -261,11 +286,46 @@ float sensorVal;
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu AC Dimming (Zero-Cross Phase Control)
 // nunununununununununununununununununununununununununununununun
-volatile uint8_t pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
+//
+// NOTE: No dedicated AC dimmer library is used here because the available
+// libraries (RBDdimmer, dimmable-light-arduino) conflict with ESP32-S3's
+// hardware timer API changes in Arduino core v3.x.  The hand-rolled
+// zero-cross + one-shot timer approach below is equivalent and confirmed
+// to compile on ESP32-S3 core 3.x.
+//
+// How it works:
+//   1. zeroCrossISR fires on every AC zero-crossing (100 times/sec at 50 Hz).
+//   2. It starts a one-shot hardware timer whose period is calculated from
+//      pumpBrightness: high brightness → short delay → TRIAC fires early in
+//      the half-cycle → more power delivered.
+//   3. triacTriggerISR fires when the timer expires and pulses the TRIAC gate.
+//
+// Brightness mapping (pumpBrightness 0–255):
+//   0   → pump OFF  (ISR returns immediately, no TRIAC trigger)
+//   255 → FULL power (TRIAC triggered immediately at zero-cross)
+//   1–254 → delay = map(brightness, 0, 255, 10000µs, 100µs)
+//            i.e. brightness=128 → ~5050µs delay → ~50% power
+//
+// Idle pressure threshold above which the boiler is considered full.
+// It switches dynamically: 5.0 bar when steam is hot (>80°C), otherwise 0.5 bar.
+float boilerFullPressureBar = 0.5f;
+
+// Dimmer debug counters (global so brewDetect can seed them at brew start)
+unsigned long lastDimmerDebugMs = 0;
+uint32_t lastZeroCrossCountDebug = 0;
+// Latch: once pressure cuts the pump in idle, stay off until next brew ends
+bool boilerFullLatch = false;
+// Latch: once the predicted weight reaches target during a profiled brew,
+// keep the pump off until the brew ends (lever released)
+bool targetWeightReached = false;
+volatile uint8_t  pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
+volatile uint32_t zeroCrossCount = 0;    // Incremented in ISR, read in debug
 hw_timer_t *acTimer = NULL;
 portMUX_TYPE acTimerMux = portMUX_INITIALIZER_UNLOCKED;
 
 void IRAM_ATTR zeroCrossISR() {
+  zeroCrossCount++;  // Count every half-cycle (debug: expect 100/s at 50 Hz)
+
   // Zero-cross detected — start timer for TRIAC trigger delay
   if (pumpBrightness == 0) {
     return;  // Off, don't trigger
@@ -274,7 +334,7 @@ void IRAM_ATTR zeroCrossISR() {
   if (pumpBrightness == 255) {
     // Full power - trigger immediately with a pulse
     digitalWrite(PUMP_PIN, HIGH);
-    delayMicroseconds(10);  // 10μs gate pulse
+    delayMicroseconds(100);  // 100µs gate pulse — matches triacTriggerISR
     digitalWrite(PUMP_PIN, LOW);
     return;
   }
@@ -291,15 +351,117 @@ void IRAM_ATTR zeroCrossISR() {
 
 void IRAM_ATTR triacTriggerISR() {
   digitalWrite(PUMP_PIN, HIGH);  // Trigger TRIAC
-  delayMicroseconds(10);         // 10μs pulse
+  delayMicroseconds(100);        // 100µs pulse — minimum for reliable MOC3021/BT136 triggering
   digitalWrite(PUMP_PIN, LOW);
 }
 
 void setPumpBrightness(uint8_t brightness) {
   portENTER_CRITICAL(&acTimerMux);
+  uint8_t prev = pumpBrightness;
   pumpBrightness = brightness;
   portEXIT_CRITICAL(&acTimerMux);
+
+  // Log every change so we can trace what is sent to the dimmer
+  if (brightness != prev) {
+    uint32_t delayUs = 0;
+    if (brightness > 0 && brightness < 255)
+      delayUs = map(brightness, 0, 255, 10000, 100);
+
+    Serial.print("[DIMMER] ");
+    Serial.print(prev); Serial.print(" → "); Serial.print(brightness);
+    Serial.print("/255  (");
+    Serial.print(brightness * 100 / 255);
+    Serial.print("%)");
+    if (brightness == 0)        Serial.print("  → PUMP OFF (no TRIAC trigger)");
+    else if (brightness == 255) Serial.print("  → FULL POWER (immediate trigger)");
+    else { Serial.print("  → TRIAC delay "); Serial.print(delayUs); Serial.print("µs"); }
+    Serial.println();
+  }
 }
+
+// nunununununununununununununununununununununununununununununun
+// nunununununununununununu OTA (Over-The-Air Updates)
+// nunununununununununununununununununununununununununununununun
+#ifdef ENABLE_OTA
+// OTA needs WiFi. In this build WiFi may otherwise be disabled for BLE, so the
+// helpers below bring WiFi up themselves (non-blocking) and start the OTA
+// service lazily once an IP is obtained. Normal operation never blocks on OTA.
+bool otaInitialized = false;
+unsigned long lastOtaWifiAttemptMs = 0;
+const unsigned long OTA_WIFI_RETRY_INTERVAL_MS = 10000;  // background reconnect cadence
+
+void setupOTA()
+{
+#ifdef DISABLE_WIFI_MQTT
+  // WiFi is not started anywhere else in this build — OTA must bring it up.
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("MaraXController");
+  WiFi.begin(wifi_ssid, wifi_password);
+  lastOtaWifiAttemptMs = millis();
+#endif
+
+  ArduinoOTA.setHostname("MaraXController");
+  // Optional: require a password to push updates (recommended on shared networks).
+  // ArduinoOTA.setPassword("admin");
+
+  ArduinoOTA
+    .onStart([]() {
+      // Safety: kill the pump before the device reboots into new firmware.
+      setPumpBrightness(0);
+      String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+      Serial.println("[OTA] Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\n[OTA] End");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      static unsigned long lastOtaProgressMs = 0;
+      if (total > 0 && millis() - lastOtaProgressMs > 500) {
+        Serial.printf("[OTA] Progress: %u%%\n", (progress / (total / 100)));
+        lastOtaProgressMs = millis();
+      }
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("[OTA] Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR)         Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR)   Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR)     Serial.println("End Failed");
+    });
+
+  Serial.println("[OTA] Configured — waiting for WiFi to start the service");
+}
+
+void handleOTA()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    if (!otaInitialized)
+    {
+      ArduinoOTA.begin();
+      otaInitialized = true;
+      Serial.print("[OTA] Ready — hostname MaraXController, IP: ");
+      Serial.println(WiFi.localIP());
+    }
+    ArduinoOTA.handle();
+  }
+  else
+  {
+    otaInitialized = false;  // re-announce the service after a reconnect
+#ifdef DISABLE_WIFI_MQTT
+    // Only OTA manages WiFi in this build, so retry the connection here.
+    // (When MQTT is enabled, tryReconnectWifi() owns reconnection instead.)
+    unsigned long now = millis();
+    if (now - lastOtaWifiAttemptMs >= OTA_WIFI_RETRY_INTERVAL_MS)
+    {
+      lastOtaWifiAttemptMs = now;
+      WiFi.begin(wifi_ssid, wifi_password);
+    }
+#endif
+  }
+}
+#endif  // ENABLE_OTA
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu Setup
@@ -327,14 +489,16 @@ void setup()
   acTimer = timerBegin(1000000);  // 1MHz (1μs resolution)
   timerAttachInterrupt(acTimer, &triacTriggerISR);
   
-  // Zero-cross interrupt
-  attachInterrupt(digitalPinToInterrupt(AC_ZERO_CROSS_PIN), zeroCrossISR, RISING);
+  // Zero-cross interrupt — try CHANGE if RISING gives ~75 ZC/s instead of ~100
+  attachInterrupt(digitalPinToInterrupt(AC_ZERO_CROSS_PIN), zeroCrossISR, CHANGE);
   
-  setPumpBrightness(255);  // Full power - allow machine to control pump normally
+  setPumpBrightness(255);  // Dimmer at 100% — GiCar decides whether pump runs
 
   pinMode(BREW_SWITCH_PIN, INPUT_PULLUP);
-  // Marax Brew Switch Relay output
+  // Relay signals GiCar that brew switch is active (mirrors brew switch state)
+  // Deenergized (LOW) at startup = GiCar sees switch as OFF
   pinMode(BREW_RELAY_PIN, OUTPUT);
+  digitalWrite(BREW_RELAY_PIN, LOW);
 
   // Initialize SPI bus with custom pins for the SD card
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
@@ -360,14 +524,26 @@ void setup()
   Serial.print("[DEBUG] Initial Serial1.available(): "); Serial.println(availBytes);
 
   // Nextion display on UART2 with explicit pin assignment.
+  // The HMI file shipped in this repo is configured for 115200 baud, so
+  // UART2 must use the same rate here or the display will ignore writes.
   // We initialize Serial2 directly instead of calling myNex.begin(),
   // because myNex.begin() would call Serial2.begin(baud) without pin
   // arguments and overwrite our custom pin assignment.
-  Serial2.begin(9600, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
-  Serial.println("[DEBUG] Serial2 (Nextion) started at 9600");
+  Serial2.begin(115200, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
+  Serial.println("[DEBUG] Serial2 (Nextion) started at 115200");
 
   // Force a known value onto the display right now to verify display wiring
+  Serial.println("[DEBUG] Testing Nextion display - writing BOOT to t0.txt");
   myNex.writeStr("t0.txt", "BOOT");
+  delay(100);
+  
+  // Check if display responds by reading connect message
+  while (Serial2.available())
+  {
+    Serial.print("[DEBUG] Nextion response: 0x");
+    Serial.println(Serial2.read(), HEX);
+  }
+  
   delay(2000);
   Serial1.write(0x11);
   Serial.println("[DEBUG] Sent 0x11 wakeup to machine");
@@ -375,7 +551,29 @@ void setup()
   // Serial Marax
   memset(receivedCharsFromMarax, 0, numCharsSerialMarax);
 
+  // IMPORTANT: Initialize BLE scale BEFORE WiFi to avoid conflicts
+  // BLE and WiFi share radio resources on ESP32, init BLE first
+  Serial.println("[DEBUG] Initializing BLE hardware (NimBLE)...");
+  
+  if (strlen(SCALE_MAC_ADDRESS) > 0)
+  {
+    Serial.print("[DEBUG] Connecting to scale MAC: ");
+    Serial.println(SCALE_MAC_ADDRESS);
+  }
+  else
+  {
+    Serial.println("[DEBUG] Auto-discovering any Felicita/Acaia scale...");
+  }
+  
+  // Try to connect to scale BEFORE starting WiFi (best conditions for BLE)
+  scaleConnected = scale.init(SCALE_MAC_ADDRESS);
+  Serial.println(scaleConnected ? "[DEBUG] Scale connected" : "[DEBUG] Scale not found (will retry after WiFi starts)");
+  updateScaleConnectionUi();
+  lastScaleReconnectAttemptMs = millis();
+
+#ifndef DISABLE_WIFI_MQTT
   // WiFi — non-blocking, continue even if connection fails
+  Serial.println("[DEBUG] Starting WiFi...");
   WiFi.setHostname("MaraXController");
   WiFi.begin(wifi_ssid, wifi_password);
   unsigned long wifiStartTime = millis();
@@ -384,12 +582,31 @@ void setup()
     delay(500);
   }
   wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected)
+  {
+    Serial.print("[DEBUG] WiFi connected - IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println("[DEBUG] WiFi connection failed");
+  }
   lastWifiReconnectAttemptMs = millis();
+#else
+  Serial.println("[DEBUG] WiFi/MQTT disabled for testing");
+#endif
+
+#ifdef ENABLE_OTA
+  setupOTA();
+#endif
 
   // SD card init
+  Serial.print("[SD] Mounting SD card on CS=GPIO"); Serial.println(SD_CS_PIN);
   if (SD.begin(SD_CS_PIN))
   {
     sdReady = true;
+    Serial.print("[SD] Mounted OK — card type: "); Serial.print(SD.cardType());
+    Serial.print("  size: "); Serial.print(SD.totalBytes() / (1024 * 1024)); Serial.println(" MB");
 
     if (!SD.exists("/profiles"))
       SD.mkdir("/profiles");
@@ -417,26 +634,29 @@ void setup()
       loadObservations();
     }
 
+    Serial.print("[DEBUG] Setting up profiles - count:"); Serial.println(profileCount);
+    Serial.print("[DEBUG] Profile list string: "); Serial.println(profileListStr);
+    Serial.print("[DEBUG] Active profile: "); Serial.println(activeProfileName);
+    
+    // NOTE: profileList.txt and actProftxt.txt components must exist in HMI
     myNex.writeStr("profileList.txt", profileListStr.c_str());
-    myNex.writeStr("actProftxt", activeProfileName);
+    Serial.println("[DEBUG] Sent profileList.txt");
+    
+    myNex.writeStr("actProfile.txt", activeProfileName);
+    Serial.println("[DEBUG] Sent actProfiletxt.txt");
+    
     updateProfileSelectUi();
     updateProfileModeText();
   }
-
-  // Initialize scale with auto-discovery (empty MAC = connect to any Felicita scale)
-  // Skip initialization if MAC address is empty to avoid BLE stack issues
-  if (strlen(SCALE_MAC_ADDRESS) > 0)
-  {
-    scaleConnected = scale.init(SCALE_MAC_ADDRESS);
-    Serial.println(scaleConnected ? "[DEBUG] Scale connected" : "[DEBUG] Scale not found");
-  }
   else
   {
-    scaleConnected = false;
-    Serial.println("[DEBUG] Scale init skipped - no MAC address configured");
+    Serial.println("[SD] FAILED to mount SD card — check wiring and card format (FAT32)");
+    Serial.print("[SD]   CS=GPIO"); Serial.print(SD_CS_PIN);
+    Serial.print("  SCK=GPIO"); Serial.print(SD_SCK_PIN);
+    Serial.print("  MOSI=GPIO"); Serial.print(SD_MOSI_PIN);
+    Serial.print("  MISO=GPIO"); Serial.println(SD_MISO_PIN);
   }
-  updateScaleConnectionUi();
-  lastScaleReconnectAttemptMs = millis();
+
   Serial.println("[DEBUG] setup() complete");
 }
 
@@ -447,20 +667,26 @@ void loop()
 {
   updateScale();
   tryReconnectScale();
+#ifndef DISABLE_WIFI_MQTT
   tryReconnectWifi();
   tryReconnectMqtt();
-  checkPendingObservation();
-
   if (mqttClient.connected())
   {
     mqttClient.loop();
   }
+#endif
+#ifdef ENABLE_OTA
+  handleOTA();  // Non-blocking: services OTA and (re)connects WiFi in background
+#endif
+  checkPendingObservation();
+
   myNex.NextionListen();
 
   getMaschineInput();
   updateDisplay();
   updateMqtt();
   brewDetect();
+  updateIdlePumpControl();  // Cut dimmer when boiler is full, restore when empty
 
   liveData();
   pressureProfile();
@@ -508,6 +734,7 @@ void callbackfun(char *topic, byte *payload, unsigned int length)
 
 void updateMqtt()
 {
+#ifndef DISABLE_WIFI_MQTT
   if ((millis() - updateMqttTimer > 5000) && !brewActive && POWER_ON)
   {
     mqttClient.publish(debug_topic, toCharArray(String(receivedCharsFromMarax)), true);
@@ -521,6 +748,7 @@ void updateMqtt()
 
     updateMqttTimer = millis();
   }
+#endif
 }
 
 const char *toCharArray(const String &str)
@@ -616,16 +844,20 @@ bool loadProfile(const char *filename)
 {
   if (!sdReady)
   {
+    Serial.println("[SD] loadProfile: sdReady=false");
     return false;
   }
 
   char path[MAX_PATH_LEN];
   snprintf(path, sizeof(path), "/profiles/%s", filename);
+  Serial.print("[SD] loadProfile: opening '"); Serial.print(path); Serial.println("'");
   File f = SD.open(path);
   if (!f)
   {
+    Serial.print("[SD] loadProfile: FAILED to open '"); Serial.print(path); Serial.println("'");
     return false;
   }
+  Serial.print("[SD] loadProfile: opened OK — size="); Serial.println(f.size());
 
   String line;
   f.readStringUntil('\n');
@@ -658,28 +890,28 @@ bool loadProfile(const char *filename)
       break;
     case 1:
       t1p = atoi(token);
-      t1pWave = map(t1p, 0, 10, 0, 164);
+      t1pWave = map(t1p, 0, 10, 0, 180);
       break;
     case 2:
       t1t = atoi(token);
       break;
     case 3:
       t2p = atoi(token);
-      t2pWave = map(t2p, 0, 10, 0, 164);
+      t2pWave = map(t2p, 0, 10, 0, 180);
       break;
     case 4:
       t2t = atoi(token);
       break;
     case 5:
       t3p = atoi(token);
-      t3pWave = map(t3p, 0, 10, 0, 164);
+      t3pWave = map(t3p, 0, 10, 0, 180);
       break;
     case 6:
       t3t = atoi(token);
       break;
     case 7:
       t4p = atoi(token);
-      t4pWave = map(t4p, 0, 10, 0, 164);
+      t4pWave = map(t4p, 0, 10, 0, 180);
       break;
     case 8:
       t4t = atoi(token);
@@ -893,32 +1125,72 @@ void updateProfileSelectUi()
   if (currentIndex >= profileCount)
     currentIndex = maxIndex;
 
+  Serial.print("[DEBUG] updateProfileSelectUi - profileCount:"); Serial.print(profileCount);
+  Serial.print(" maxIndex:"); Serial.print(maxIndex);
+  Serial.print(" currentIndex:"); Serial.println(currentIndex);
+  
+  // NOTE: profileMax and selectedProfile may not exist in HMI as global variables
+  // Check if these are defined in your Nextion display!
   myNex.writeNum("profileMax", maxIndex);
+  Serial.print("[DEBUG] Sent profileMax="); Serial.println(maxIndex);
+  
   myNex.writeNum("selectedProfile", currentIndex);
+  Serial.print("[DEBUG] Sent selectedProfile="); Serial.println(currentIndex);
 }
 
 void updateProfileModeText()
 {
+  static char lastProfileMode[PROFILE_NAME_MAX_LEN] = "";
+  const char* newMode;
+
   if (pressureProfilingEnabled && remoteProfilingEnabled && sdReady)
   {
-    myNex.writeStr("profileModeTxt", activeProfileName);
+    newMode = activeProfileName;
+    myNex.writeStr("profileModetxt.txt", activeProfileName);  // local var on brew page (for Preinitialize)
+    myNex.writeStr("profileMode.txt", activeProfileName);    // direct write if currently on brew page
   }
   else if (pressureProfilingEnabled)
   {
-    myNex.writeStr("profileModeTxt", "Manual");
+    newMode = "Manual";
+    myNex.writeStr("profileModetxt.txt", "Manual");
+    myNex.writeStr("profileMode.txt", "Manual");
   }
   else
   {
-    myNex.writeStr("profileModeTxt", "None");
+    newMode = "None";
+    myNex.writeStr("profileModetxt.txt", "None");
+    myNex.writeStr("profileMode.txt", "None");
+  }
+
+  // Only log if mode actually changed
+  if (strcmp(newMode, lastProfileMode) != 0)
+  {
+    Serial.print("[DEBUG] Profile mode changed: ");
+    Serial.print(lastProfileMode);
+    Serial.print(" -> ");
+    Serial.println(newMode);
+    strncpy(lastProfileMode, newMode, sizeof(lastProfileMode) - 1);
+    lastProfileMode[sizeof(lastProfileMode) - 1] = '\0';
   }
 }
 
 void updateScaleConnectionUi()
 {
   int connected = scaleConnected ? 1 : 0;
+  
   if (connected != lastScaleConnectedUi)
   {
+    Serial.print("[DEBUG] Scale connection changed: "); 
+    Serial.print(lastScaleConnectedUi);
+    Serial.print(" -> ");
+    Serial.println(connected);
+
+    // Update global variable (used by home page timer to refresh scalecon.val)
     myNex.writeNum("scaleConnected", connected);
+    // Directly update p3.pic on home page (pic 20=connected, 21=disconnected)
+    // home.p3.pic works as a cross-page write; silently ignored if home page not loaded
+    myNex.writeNum("home.p3.pic", connected ? 20 : 21);
+
     lastScaleConnectedUi = connected;
   }
 }
@@ -930,12 +1202,6 @@ void tryReconnectScale()
     return;
   }
 
-  // Skip if no MAC address configured
-  if (strlen(SCALE_MAC_ADDRESS) == 0)
-  {
-    return;
-  }
-
   unsigned long now = millis();
   if (now - lastScaleReconnectAttemptMs < SCALE_RECONNECT_INTERVAL_MS)
   {
@@ -943,17 +1209,23 @@ void tryReconnectScale()
   }
 
   lastScaleReconnectAttemptMs = now;
-  // Auto-discover and connect to any available Felicita scale
+  
+  // With WiFi disabled, BLE has full control of the radio
+  Serial.println("[DEBUG] Attempting BLE scale reconnection...");
+  
+  // Reinitialize and reconnect to scale (auto-discovers if MAC is empty)
   scaleConnected = scale.init(SCALE_MAC_ADDRESS);
   if (!scaleConnected)
   {
     flowRate = 0.0f;
   }
+  
   updateScaleConnectionUi();
 }
 
 void tryReconnectWifi()
 {
+#ifndef DISABLE_WIFI_MQTT
   if (WiFi.status() == WL_CONNECTED)
   {
     wifiConnected = true;
@@ -970,10 +1242,12 @@ void tryReconnectWifi()
 
   lastWifiReconnectAttemptMs = now;
   WiFi.begin(wifi_ssid, wifi_password);
+#endif
 }
 
 void tryReconnectMqtt()
 {
+#ifndef DISABLE_WIFI_MQTT
   if (mqttClient.connected())
   {
     return;
@@ -996,6 +1270,7 @@ void tryReconnectMqtt()
   {
     mqttClient.subscribe("marax/remoteProfile");
   }
+#endif
 }
 
 void scanProfiles()
@@ -1005,15 +1280,20 @@ void scanProfiles()
 
   if (!sdReady)
   {
+    Serial.println("[SD] scanProfiles: sdReady=false — skipping");
     return;
   }
 
+  Serial.println("[SD] scanProfiles: opening /profiles");
   File dir = SD.open("/profiles");
   if (!dir)
   {
+    Serial.println("[SD] scanProfiles: FAILED to open /profiles directory");
     return;
   }
+  Serial.println("[SD] scanProfiles: directory opened OK");
 
+  int skipped = 0;
   while (profileCount < MAX_PROFILES)
   {
     File entry = dir.openNextFile();
@@ -1022,9 +1302,14 @@ void scanProfiles()
       break;
     }
 
-    if (!entry.isDirectory())
+    String rawName = entry.name();
+    bool isDir = entry.isDirectory();
+    Serial.print("[SD] scanProfiles: entry='" ); Serial.print(rawName);
+    Serial.print("' isDir="); Serial.println(isDir);
+
+    if (!isDir)
     {
-      String name = entry.name();
+      String name = rawName;
       int slashIndex = name.lastIndexOf('/');
       if (slashIndex >= 0)
       {
@@ -1040,12 +1325,20 @@ void scanProfiles()
           profileListStr += ",";
         }
         profileListStr += name.substring(0, name.length() - 4);
+        Serial.print("[SD] scanProfiles: added profile '"); Serial.print(profileNames[profileCount]); Serial.println("'");
         profileCount++;
+      }
+      else
+      {
+        Serial.print("[SD] scanProfiles: skipped (not .csv): "); Serial.println(name);
+        skipped++;
       }
     }
     entry.close();
   }
   dir.close();
+  Serial.print("[SD] scanProfiles: done — found "); Serial.print(profileCount);
+  Serial.print(" profiles, skipped "); Serial.println(skipped);
 }
 
 void updateScale()
@@ -1148,21 +1441,53 @@ void liveData()
   if (brewActive)
   {
     // Write Brew Temp
-    myNex.writeNum("brewTemp.val", brewTemp);
+    myNex.writeNum("brewTemp", brewTemp);
     // Write BrewTimer
     myNex.writeNum("brewTime", (int)((millis() - activeBrewingStart) / 1000));
     // Write Live Pressure as normal number
     float pressure = getPressure();
-    int pressureInt = pressure * 100;
-    myNex.writeNum("barvar.val", pressureInt);
-    // Map the pressure to wave pixels in graph
-    barGraphValue = map(pressureInt, 0, 1000, 0, 164);
+    // brewBar is an XFloat with 3 decimal places: it displays value/1000.
+    myNex.writeNum("barvar.val", (int)(pressure * 100));
+    // Map the pressure to wave pixels in graph (0–10 bar → 0–180 px)
+    barGraphValue = map((int)(pressure * 100), 0, 1000, 0, 180);
     myNex.writeNum("barwave.val", barGraphValue);
 
     if (scaleConnected)
     {
       myNex.writeNum("weightVar.val", (int)(currentWeight * 10));
       myNex.writeNum("flowVar.val", (int)(flowRate * 100));
+    }
+
+    // Periodic dimmer diagnostics (every 1 second during brew)
+    // lastDimmerDebugMs and lastZeroCrossCountDebug are globals seeded in
+    // brewDetect() at brew start, so the very first reading is always accurate.
+    unsigned long nowMs = millis();
+    if (nowMs - lastDimmerDebugMs >= 1000)
+    {
+      uint32_t snapshot = zeroCrossCount;  // single read, ISR-safe for uint32
+      uint32_t crossingsPerSec = snapshot - lastZeroCrossCountDebug;
+      lastZeroCrossCountDebug = snapshot;
+      unsigned long windowMs = nowMs - lastDimmerDebugMs;  // actual elapsed time
+      lastDimmerDebugMs = nowMs;
+
+      uint8_t brt = pumpBrightness;  // snapshot volatile
+      uint32_t delayUs = 0;
+      if (brt > 0 && brt < 255)
+        delayUs = map(brt, 0, 255, 10000, 100);
+
+      // Normalise: scale to per-second if the window was stretched by Nextion I/O
+      uint32_t zcPerSec = (windowMs > 0) ? (crossingsPerSec * 1000UL / windowMs) : crossingsPerSec;
+
+      Serial.print("[DIMMER] brightness="); Serial.print(brt);
+      Serial.print("/255 ("); Serial.print(brt * 100 / 255); Serial.print("%)");
+      if (brt == 0)        Serial.print("  PUMP OFF");
+      else if (brt == 255) Serial.print("  FULL POWER");
+      else { Serial.print("  delay="); Serial.print(delayUs); Serial.print("µs"); }
+      Serial.print("  ZC/s="); Serial.print(zcPerSec);
+      Serial.print(" (window="); Serial.print(windowMs); Serial.print("ms)");
+      if (zcPerSec < 80 || zcPerSec > 120)
+        Serial.print("  *** ABNORMAL (expect ~100 at 50 Hz) ***");
+      Serial.println();
     }
   }
 }
@@ -1206,20 +1531,55 @@ void readSettigs()
       scanProfiles();
       if (previousProfileCount != profileCount)
       {
+        Serial.print("[DEBUG] Profile count changed: "); Serial.print(previousProfileCount);
+        Serial.print(" -> "); Serial.println(profileCount);
         updateProfileSelectUi();
       }
     }
 
     getPressure();
-    pressureProfilingEnabled = myNex.readNumber("pPEnabled");
-    remoteProfilingEnabled = myNex.readNumber("remoteEnabled");
+    
+    // Read Nextion variables (only log if values change)
+    static int lastPPEnabled = -1;
+    static int lastRemoteEnabled = -1;
+    static int lastSelectedProfile = -1;
+    
+    // readNumber() returns -1 on timeout/error. Guard: only accept 0 or 1.
+    int rawPP = myNex.readNumber("pPEnabled");
+    if (rawPP >= 0) pressureProfilingEnabled = (rawPP != 0);
+    int rawRemote = myNex.readNumber("remoteEnabled");
+    if (rawRemote >= 0) remoteProfilingEnabled = (rawRemote != 0);
 
+    // NOTE: selectedProfile variable may not exist in HMI!
     int idx = myNex.readNumber("selectedProfile");
-    if (idx < 0)
-      idx = 0;
-    if (idx >= profileCount)
-      idx = profileCount - 1;
 
+    // Clamp to valid range. Guard against profileCount==0 which makes
+    // the upper clamp produce -1 (profileCount-1 = -1).
+    if (profileCount <= 0)
+    {
+      idx = 0;  // no profiles loaded yet — nothing to select
+    }
+    else
+    {
+      if (idx < 0) idx = 0;
+      if (idx >= profileCount) idx = profileCount - 1;
+    }
+    
+    // Only log if settings actually changed
+    if (pressureProfilingEnabled != lastPPEnabled || 
+        remoteProfilingEnabled != lastRemoteEnabled || 
+        idx != lastSelectedProfile)
+    {
+      Serial.print("[DEBUG] Settings changed - pPEnabled:"); Serial.print(pressureProfilingEnabled);
+      Serial.print(" remoteEnabled:"); Serial.print(remoteProfilingEnabled);
+      Serial.print(" selectedProfile:"); Serial.println(idx);
+      
+      lastPPEnabled = pressureProfilingEnabled;
+      lastRemoteEnabled = remoteProfilingEnabled;
+      lastSelectedProfile = idx;
+    }
+
+    // Remote profiling: use selected profile from SD card
     bool usePresetProfile = pressureProfilingEnabled && remoteProfilingEnabled && sdReady && idx >= 0 && idx < profileCount;
     if (usePresetProfile && idx != selectedProfileIndex)
     {
@@ -1228,46 +1588,57 @@ void readSettigs()
       {
         loadBeta();
         loadObservations();
-        myNex.writeStr("actProftxt", activeProfileName);
+        myNex.writeStr("actProfile.txt", activeProfileName);
+        // Target weight comes from loaded profile
       }
     }
-    else if (!usePresetProfile && pressureProfilingEnabled)
+    
+    // Manual mode (pressure profiling ON, remote OFF): read manual pressure settings
+    if (!remoteProfilingEnabled && pressureProfilingEnabled)
     {
       int temp = myNex.readNumber("t1p");
       if (temp != t1p)
       {
         t1p = temp;
-        t1pWave = map(temp, 0, 10, 0, 164);
+        t1pWave = map(temp, 0, 10, 0, 180);
       }
       temp = myNex.readNumber("t2p");
       if (temp != t2p)
       {
         t2p = temp;
-        t2pWave = map(temp, 0, 10, 0, 164);
+        t2pWave = map(temp, 0, 10, 0, 180);
       }
       temp = myNex.readNumber("t3p");
       if (temp != t3p)
       {
         t3p = temp;
-        t3pWave = map(temp, 0, 10, 0, 164);
+        t3pWave = map(temp, 0, 10, 0, 180);
       }
       temp = myNex.readNumber("t4p");
       if (temp != t4p)
       {
         t4p = temp;
-        t4pWave = map(temp, 0, 10, 0, 164);
+        t4pWave = map(temp, 0, 10, 0, 180);
       }
 
       t1t = myNex.readNumber("t1t");
       t2t = myNex.readNumber("t2t");
       t3t = myNex.readNumber("t3t");
       t4t = myNex.readNumber("t4t");
-
-      // Manual profile mode also lets the user choose the target weight.
+    }
+    
+    // When remote profiling is OFF, display targetWeight is always authoritative
+    if (!remoteProfilingEnabled)
+    {
       int manualTargetWeight = myNex.readNumber("targetWeight");
-      if (manualTargetWeight >= 0 && manualTargetWeight != (int)targetWeight)
+      if (manualTargetWeight >= 0)
       {
-        targetWeight = (float)manualTargetWeight;
+        if (manualTargetWeight != (int)targetWeight)
+        {
+          Serial.print("[DEBUG] Target weight changed: "); Serial.print(targetWeight);
+          Serial.print("g -> "); Serial.print(manualTargetWeight); Serial.println("g");
+        }
+        targetWeight = (float)manualTargetWeight;  // Always sync from display
       }
     }
 
@@ -1282,36 +1653,36 @@ void updateDisplay()
   {
     if (POWER_ON && displayIsInSleep)
     {
+      Serial.println("[DEBUG] Display waking up");
       myNex.writeNum("sleep", 0);
       displayIsInSleep = false;
     }
     else if (!POWER_ON && !displayIsInSleep)
     {
+      Serial.println("[DEBUG] Display going to sleep");
       myNex.writeStr("page home");
       myNex.writeNum("sleep", 1);
       displayIsInSleep = true;
     }
 
+    // Throttled debug output - only every 10 seconds
     static unsigned long lastDisplayDebugMs = 0;
-    if (millis() - lastDisplayDebugMs > 5000) {
-      Serial.print("[DEBUG] Display update — brewTemp:"); Serial.print(brewTemp);
+    if (millis() - lastDisplayDebugMs > 10000) {
+      Serial.print("[DEBUG] Display status — brewTemp:"); Serial.print(brewTemp);
       Serial.print(" steamTemp:"); Serial.print(steamTemp);
-      Serial.print(" POWER_ON:"); Serial.println(POWER_ON);
+      Serial.print(" POWER_ON:"); Serial.print(POWER_ON);
+      Serial.print(" page:"); Serial.println(currentPageId);
       lastDisplayDebugMs = millis();
     }
     
-    Serial.print("[NEXTION] Writing brewTemp="); Serial.println(brewTemp);
-    myNex.writeNum("brewTemp.val", brewTemp);
-    
-    Serial.print("[NEXTION] Writing steamTemp="); Serial.println(steamTemp);
-    myNex.writeNum("steamTemp.val", steamTemp);
-    
-    // Try reading back to verify communication
-    int readBack1 = myNex.readNumber("brewTemp.val");
-    Serial.print("[NEXTION] Read back brewTemp: "); Serial.println(readBack1);
-    int readBack2 = myNex.readNumber("steamTemp.val");
-    Serial.print("[NEXTION] Read back steamTemp: "); Serial.println(readBack2);
+    // Send updated values to display (no debug spam)
+    myNex.writeNum("brewTemp", brewTemp);
+    myNex.writeNum("steamTemp", steamTemp);
+    myNex.writeStr("actProfile.txt", activeProfileName);
+    updateProfileModeText();
+    // NOTE: targetWeight variable may not exist in HMI!
     myNex.writeNum("targetWeight", (int)targetWeight);
+    
     updateScaleConnectionUi();
 
     currentPageId = myNex.readNumber("dp");
@@ -1321,21 +1692,18 @@ void updateDisplay()
       lastPageId = currentPageId;
     }
 
-    if (currentPageId == 4278190086 || currentPageId == 6)
-    {
-      myNex.writeNum("tarsteam.val", steamTargetTemp);
-      delay(5);
-      myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
-      delay(5);
-      myNex.writeNum("heatingel.val", heatingElementOn);
-      delay(5);
-    }
+    // Always write all values - page checks removed for simplicity
+    myNex.writeNum("tarsteam.val", steamTargetTemp);
+    myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
+    myNex.writeNum("heatingel.val", heatingElementOn);
 
+    // Read settings (except during active brew)
     if (currentPageId != 4278190082 && currentPageId != 2)
     {
       readSettigs();
     }
 
+    // Check if we're on cleaning page
     if (currentPageId == 4278190086 || currentPageId == 6)
     {
       cleaningModeActive = true;
@@ -1351,11 +1719,43 @@ void updateDisplay()
   }
 }
 
+// Controls the dimmer during idle (not brewing).
+// When pressure is detected the boiler is full — cut dimmer so pump stops.
+// When pressure drops back to zero the boiler needs water — restore dimmer
+// to 100% so GiCar can run the pump through it unimpeded.
+void updateIdlePumpControl()
+{
+  if (brewActive) return;  // During brew, pressureProfile() owns the dimmer
+
+  // During cleaning/backflush the GiCar drives the pump on each lever press.
+  // Keep the dimmer fully open so backflush pressure can build — the idle
+  // "boiler full" cut-off below must not fight it.
+  if (cleaningModeActive || cleaningRunActive)
+  {
+    if (pumpBrightness != 255) setPumpBrightness(255);
+    return;
+  }
+
+  boilerFullPressureBar = (steamTemp > 80) ? 5.0f : 0.5f;
+  float p = getPressure();
+  if (p > boilerFullPressureBar)
+  {
+    // Boiler has pressure — latch off and cut power
+    boilerFullLatch = true;
+    if (pumpBrightness != 0) setPumpBrightness(0);
+  }
+  else if (!boilerFullLatch)
+  {
+    // No pressure and not latched — allow GiCar to run the pump
+    if (pumpBrightness != 255) setPumpBrightness(255);
+  }
+  // If latched and pressure is gone: stay at 0 until brew ends
+}
+
 void setPressure(float targetValue)
 {
   int pumpValue;
   float currentPressure = (getPressure() - 1.7f);
-  float diff = targetValue - currentPressure;
 
   if (targetValue == 0 || currentPressure > targetValue)
   {
@@ -1373,11 +1773,31 @@ void pressureProfile()
 {
   if (brewActive && pressureProfilingEnabled)
   {
+    // Safety: if all profile segments have zero duration, the profile is not
+    // configured. Skip profiling so the pump is not silently killed.
+    int totalProfileTime = t1t + t2t + t3t + t4t;
+    if (totalProfileTime == 0)
+    {
+      setPumpBrightness(255);  // No profile configured → full power
+      return;
+    }
+
+    // Target-weight latch: once the predicted final weight reaches target,
+    // keep the pump off for the rest of this brew. Without this latch the
+    // flow/pressure collapse after the pump stops drops the prediction back
+    // under target, and the profile segments below would switch it on again.
+    if (targetWeightReached)
+    {
+      setPumpBrightness(0);
+      return;
+    }
+
     if (scaleConnected && targetWeight > 0.0f)
     {
       float predicted = predictedFinalWeight(flowRate, getPressure());
       if (predicted >= targetWeight)
       {
+        targetWeightReached = true;
         setPumpBrightness(0);
         myNex.writeNum("n0.pco", 1535);
         myNex.writeNum("n1.pco", 1535);
@@ -1460,20 +1880,33 @@ void brewDetect()
       brewTimer(true);
       myNex.writeNum("pBrew.pic", 25);
       brewActive = true;
-      
-      // If pressure profiling is disabled, set pump to full power immediately
-      if (!pressureProfilingEnabled)
-      {
-        setPumpBrightness(255);
-      }
+      targetWeightReached = false;  // Fresh brew — clear the weight cut-off latch
+
+      // Seed dimmer debug counters so the first ZC/s reading is not
+      // inflated by zero-crossings accumulated since boot.
+      lastZeroCrossCountDebug = zeroCrossCount;
+      lastDimmerDebugMs = millis();
+
+      // Enable TRIAC at full power; pressureProfile() adjusts immediately if profiling is enabled
+      setPumpBrightness(255);
     }
   }
   else
   {
+    bool wasBrewing = brewActive;
     brewActive = false;
     brewTimer(false);
     myNex.writeNum("pBrew.pic", 8);
-    setPumpBrightness(255);  // Return to full power for normal machine operation
+
+    // Only hand the dimmer back to idle control on the brew→idle edge.
+    // Doing this every idle loop fought updateIdlePumpControl() (255↔0
+    // chatter) and reset boilerFullLatch before it could ever hold.
+    if (wasBrewing)
+    {
+      boilerFullLatch = false;      // Unlock idle control for next fill cycle
+      targetWeightReached = false;  // Clear weight cut-off latch for next brew
+      setPumpBrightness(255);       // Dimmer back to 100% — GiCar has full pump control
+    }
 
     if (cleaningRunActive)
     {
@@ -1487,12 +1920,12 @@ bool brewState()
 {
   if (digitalRead(BREW_SWITCH_PIN) == LOW)
   {
-    digitalWrite(BREW_RELAY_PIN, false);
+    digitalWrite(BREW_RELAY_PIN, HIGH);   // Signal GiCar: brew switch ON (mirrors switch state)
     return true;
   }
   else
   {
-    digitalWrite(BREW_RELAY_PIN, true);
+    digitalWrite(BREW_RELAY_PIN, LOW);  // Signal GiCar: brew switch OFF
     return false;
   }
 }
@@ -1513,14 +1946,16 @@ void getMaschineInput()
     anyBytesReceived = true;
     rc = Serial1.read();
 
-    if (!frameReceived) {
-      Serial.print("[RAW] 0x");
-      if ((uint8_t)rc < 0x10) Serial.print("0");
-      Serial.print((uint8_t)rc, HEX);
-      Serial.print(" (");
-      if (rc >= 0x20 && rc < 0x7F) Serial.print(rc); else Serial.print('?');
-      Serial.println(")");
-    }
+    // Uncomment for raw byte debugging (disabled by default - confirmed working)
+    // if (!frameReceived) {
+    //   Serial.print("[RAW] 0x");
+    //   if ((uint8_t)rc < 0x10) Serial.print("0");
+    //   Serial.print((uint8_t)rc, HEX);
+    //   Serial.print(" (");
+    //   if (rc >= 0x20 && rc < 0x7F) Serial.print(rc); else Serial.print('?');
+    //   Serial.println(")");
+    // }
+    
     if (rc != endMarker)
     {
       receivedCharsFromMarax[ndx] = rc;
@@ -1537,8 +1972,11 @@ void getMaschineInput()
       frameReceived = true;
       newFrameThisIteration = true;
       lastFrameReceivedMs = millis();
-      Serial.print("[DEBUG] Machine frame: ");
-      Serial.println(receivedCharsFromMarax);
+      
+      // Only log frame if it contains new/changed data (not every poll)
+      static int lastBrewTemp = -1;
+      static int lastSteamTemp = -1;
+      bool tempChanged = false;
 
       // Parse CSV format: +1.10,034,138,022,0000,1,0
       // Manual split to handle empty fields correctly (strtok skips them)
@@ -1573,17 +2011,31 @@ void getMaschineInput()
       }
       
       // Parse fields
-      if (fieldCount > 1 && fields[1][0] != '\0')
+      // Frame: +1.10,103,128,077,0000,1,0
+      // field[3]=brew temp  field[2]=steam target  field[1]=steam temp  field[4]=countdown  field[5]=heating
+      if (fieldCount > 3 && fields[3][0] != '\0')
       {
-        brewTemp = atoi(fields[1]);
+        int newBrewTemp = atoi(fields[3]);
+        if (newBrewTemp != lastBrewTemp)
+        {
+          tempChanged = true;
+          lastBrewTemp = newBrewTemp;
+        }
+        brewTemp = newBrewTemp;
       }
       if (fieldCount > 2 && fields[2][0] != '\0')
       {
         steamTargetTemp = atoi(fields[2]);
       }
-      if (fieldCount > 3 && fields[3][0] != '\0')
+      if (fieldCount > 3 && fields[1][0] != '\0')
       {
-        steamTemp = atoi(fields[3]);
+        int newSteamTemp = atoi(fields[1]);
+        if (newSteamTemp != lastSteamTemp)
+        {
+          tempChanged = true;
+          lastSteamTemp = newSteamTemp;
+        }
+        steamTemp = newSteamTemp;
       }
       if (fieldCount > 4 && fields[4][0] != '\0')
       {
@@ -1594,11 +2046,16 @@ void getMaschineInput()
         heatingElementOn = atoi(fields[5]);
       }
       
-      Serial.print("[DEBUG] Parsed - brewTemp:"); Serial.print(brewTemp);
-      Serial.print(" steamTemp:"); Serial.print(steamTemp);
-      Serial.print(" steamTarget:"); Serial.print(steamTargetTemp);
-      Serial.print(" fastHeat:"); Serial.print(fastHeatingCountDown);
-      Serial.print(" heating:"); Serial.println(heatingElementOn);
+      // Only log when temps actually change
+      if (tempChanged)
+      {
+        Serial.print("[DEBUG] Machine frame: ");
+        Serial.println(receivedCharsFromMarax);
+        Serial.print("[DEBUG] Temps - brew:"); Serial.print(brewTemp);
+        Serial.print("°C steam:"); Serial.print(steamTemp);
+        Serial.print("°C target:"); Serial.print(steamTargetTemp);
+        Serial.print("°C heating:"); Serial.println(heatingElementOn ? "ON" : "OFF");
+      }
     }
   }
   
@@ -1622,6 +2079,7 @@ void getMaschineInput()
     fastHeatingCountDown = 0;
     heatingElementOn = 0;
 
+#ifndef DISABLE_WIFI_MQTT
     if (mqttClient.connected())
     {
       mqttClient.publish(brewtemp_topic, toCharArray(String(brewTemp)), true);
@@ -1632,6 +2090,7 @@ void getMaschineInput()
       mqttClient.publish(shots_topic, toCharArray(String(shotCount)), true);
       mqttClient.publish(power_topic, toCharArray(String(POWER_ON)), true);
     }
+#endif
   }
 
   if (millis() - serialMaraxUpdateMillis > 5000)
@@ -1640,20 +2099,15 @@ void getMaschineInput()
     memset(receivedCharsFromMarax, 0, numCharsSerialMarax);
     ndx = 0;
     
-    int availBefore = Serial1.available();
-    Serial.print("[DEBUG] Sending 0x11 poll to machine (Serial1.available before: ");
-    Serial.print(availBefore);
-    Serial.println(")");
-    Serial1.write(0x11);
-    
-    // Check if bytes appear shortly after sending poll
-    delay(100);
-    int availAfter = Serial1.available();
-    if (availAfter > 0)
+    // Reduced logging - only every 30 seconds (machine communication confirmed working)
+    static unsigned long lastPollDebugMs = 0;
+    if (millis() - lastPollDebugMs > 30000)
     {
-      Serial.print("[DEBUG] Got response! Serial1.available after 100ms: ");
-      Serial.println(availAfter);
+      Serial.println("[DEBUG] Polling machine...");
+      lastPollDebugMs = millis();
     }
+    
+    Serial1.write(0x11);
   }
 }
 

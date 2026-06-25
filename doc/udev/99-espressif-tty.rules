@@ -1,5 +1,0 @@
-# Grant normal users access to Espressif USB CDC/serial devices used by ESP32-S3 boards.
-# Install with: sudo cp doc/udev/99-espressif-tty.rules /etc/udev/rules.d/
-# Then reload rules: sudo udevadm control --reload-rules && sudo udevadm trigger
-
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", MODE="0666", TAG+="uaccess"

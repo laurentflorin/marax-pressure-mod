@@ -1,2 +1,2 @@
 name,t1p,t1t,t2p,t2t,t3p,t3t,t4p,t4t,target_weight
-declining_pressure,9,5,9,8,7,10,5,7,40.0
+declining_pressure,9,8,9,8,7,10,5,20,40.0
