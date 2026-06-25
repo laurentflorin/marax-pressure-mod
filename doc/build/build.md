@@ -18,7 +18,7 @@ Do not take this as a build guide, just a documentation of this mod!
 
 ## Wire Diagram
 This is the overall circuit of the mod. I did not solder anything. I use a breakout board on the ESP32 to securely fit cables to it. I use some Dupont connectors in other parts as well as Wago connectors and crimp connectors.
-![TWiring](/assets/wiring_diagram.svg)
+![TWiring](/assets/MaraX_pressure_mod.svg)
 
 ## Pressure Sensor
 
