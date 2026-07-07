@@ -885,7 +885,9 @@ void populateProfileList()
 
       sendNextionCommand(component + ".txt=\"" + nextionEscapedText(stem.c_str()) + "\"");
       sendNextionCommand(component + ".vis=1");
-      sendNextionCommand(component + ".pco=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
+      sendNextionCommand(component + ".pco=65535");
+      sendNextionCommand(component + ".bco=8518");
+      sendNextionCommand(component + ".borderc=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
     }
     else
     {
