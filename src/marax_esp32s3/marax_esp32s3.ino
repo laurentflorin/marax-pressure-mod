@@ -23,6 +23,7 @@
 #include <PubSubClient.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Preferences.h>
 #include <driver/uart.h>
 #include <NimBLEDevice.h>
 #include "FelicitaScale_NimBLE.h"
@@ -137,6 +138,18 @@ EasyNex myNex(Serial2);
 
 // Forward declaration required because PubSubClient constructor references it
 void callbackfun(char *topic, byte *payload, unsigned int length);
+void showProfileSelection();
+void populateProfileList();
+void handleProfileSelection(int rowIndex);
+bool selectProfile(int profileIndex);
+void handleNextionProfileTouchEvents();
+void loadPersistedProfileSelection();
+void persistSelectedProfile();
+bool loadProfile(const char *filename);
+void loadBeta();
+void loadObservations();
+void updateProfileModeText();
+void scanProfiles();
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -229,11 +242,15 @@ int t1p = 0, t1t = 0, t2p = 0, t2t = 0, t3p = 0, t3t = 0, t4p = 0, t4t = 0;
 int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 
 // SD / Profile globals
-#define MAX_PROFILES 10
+#define MAX_PROFILES 64
 #define PROFILE_NAME_MAX_LEN 32
 #define MAX_PATH_LEN 64
 #define PROFILE_FIELD_COUNT 10
 #define PROFILE_CSV_BUFFER_LEN 128
+#define PROFILE_ROWS_PER_PAGE 10
+#define PROFILE_TOUCH_COMPONENT_ID_MIN 5
+#define PROFILE_TOUCH_COMPONENT_ID_MAX 14
+#define PROFILE_PAGE_ID_FALLBACK 1
 #define WEIGHT_STABLE_WINDOW_MS 5000  // how long weight must be stable before committing observation
 #define WEIGHT_STABLE_THRESHOLD 0.2f  // max increase (g) over stability window
 #define OBSERVATION_MAX_WAIT_MS 30000 // max time to wait for stability after brew stop
@@ -247,8 +264,15 @@ char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
 int profileCount = 0;
 String profileListStr = "";
 int selectedProfileIndex = 0;
+int profileListPageStart = 0;
+int profileSelectionPageId = PROFILE_PAGE_ID_FALLBACK;
+bool profilePageNeedsPopulate = true;
+unsigned long lastProfileScanMs = 0;
+const unsigned long PROFILE_SCAN_INTERVAL_MS = 30000;
 float targetWeight = 36.0f;
 bool sdReady = false;
+char persistedProfileFile[PROFILE_NAME_MAX_LEN] = "";
+Preferences preferences;
 
 FelicitaScale_NimBLE scale(false);  // true = enable debug to see BLE scan results
 float currentWeight = 0.0f;
@@ -548,6 +572,9 @@ void setup()
   Serial1.write(0x11);
   Serial.println("[DEBUG] Sent 0x11 wakeup to machine");
 
+  preferences.begin("marax", false);
+  loadPersistedProfileSelection();
+
   // Serial Marax
   memset(receivedCharsFromMarax, 0, numCharsSerialMarax);
 
@@ -626,13 +653,29 @@ void setup()
     }
 
     scanProfiles();
+    lastProfileScanMs = millis();
 
-    if (profileCount > 0 && loadProfile(profileNames[0]))
+    if (profileCount > 0)
     {
-      selectedProfileIndex = 0;
-      loadBeta();
-      loadObservations();
+      int startupIndex = 0;
+      if (persistedProfileFile[0] != '\0')
+      {
+        for (int i = 0; i < profileCount; i++)
+        {
+          if (strcmp(profileNames[i], persistedProfileFile) == 0)
+          {
+            startupIndex = i;
+            break;
+          }
+        }
+      }
+      selectProfile(startupIndex);
     }
+
+    pressureProfilingEnabled = true;
+    remoteProfilingEnabled = true;
+    myNex.writeNum("pPEnabled", 1);
+    myNex.writeNum("remoteEnabled", 1);
 
     Serial.print("[DEBUG] Setting up profiles - count:"); Serial.println(profileCount);
     Serial.print("[DEBUG] Profile list string: "); Serial.println(profileListStr);
@@ -645,7 +688,7 @@ void setup()
     myNex.writeStr("actProfile.txt", activeProfileName);
     Serial.println("[DEBUG] Sent actProfiletxt.txt");
     
-    updateProfileSelectUi();
+    populateProfileList();
     updateProfileModeText();
   }
   else
@@ -680,6 +723,7 @@ void loop()
 #endif
   checkPendingObservation();
 
+  handleNextionProfileTouchEvents();
   myNex.NextionListen();
 
   getMaschineInput();
@@ -754,6 +798,166 @@ void updateMqtt()
 const char *toCharArray(const String &str)
 {
   return str.c_str();
+}
+
+void sendNextionCommand(const String &command)
+{
+  Serial2.print(command);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+}
+
+String nextionEscapedText(const char *raw)
+{
+  String escaped = "";
+  for (int i = 0; raw[i] != '\0'; i++)
+  {
+    char c = raw[i];
+    if (c == '"')
+    {
+      escaped += '\'';
+    }
+    else
+    {
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
+void loadPersistedProfileSelection()
+{
+  persistedProfileFile[0] = '\0';
+  String savedFile = preferences.getString("selected_file", "");
+  if (savedFile.length() > 0)
+  {
+    savedFile.toCharArray(persistedProfileFile, sizeof(persistedProfileFile));
+    persistedProfileFile[sizeof(persistedProfileFile) - 1] = '\0';
+  }
+}
+
+void persistSelectedProfile()
+{
+  if (selectedProfileIndex < 0 || selectedProfileIndex >= profileCount)
+  {
+    return;
+  }
+  preferences.putString("selected_file", profileNames[selectedProfileIndex]);
+}
+
+void populateProfileList()
+{
+  for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
+  {
+    int profileIndex = profileListPageStart + row;
+    String component = "profile1.t" + String(row);
+
+    if (profileIndex >= 0 && profileIndex < profileCount)
+    {
+      String stem = profileNames[profileIndex];
+      if (stem.endsWith(".csv"))
+      {
+        stem.remove(stem.length() - 4);
+      }
+
+      sendNextionCommand(component + ".txt=\"" + nextionEscapedText(stem.c_str()) + "\"");
+      sendNextionCommand(component + ".vis=1");
+      sendNextionCommand(component + ".pco=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
+    }
+    else
+    {
+      sendNextionCommand(component + ".vis=0");
+    }
+  }
+}
+
+bool selectProfile(int profileIndex)
+{
+  if (profileIndex < 0 || profileIndex >= profileCount)
+  {
+    return false;
+  }
+
+  if (!loadProfile(profileNames[profileIndex]))
+  {
+    return false;
+  }
+
+  selectedProfileIndex = profileIndex;
+  loadBeta();
+  loadObservations();
+  myNex.writeStr("actProfile.txt", activeProfileName);
+  updateProfileModeText();
+  persistSelectedProfile();
+  populateProfileList();
+  return true;
+}
+
+void handleProfileSelection(int rowIndex)
+{
+  int profileIndex = profileListPageStart + rowIndex;
+  if (!selectProfile(profileIndex))
+  {
+    return;
+  }
+
+  sendNextionCommand("page home");
+}
+
+void showProfileSelection()
+{
+  if (sdReady)
+  {
+    scanProfiles();
+    lastProfileScanMs = millis();
+  }
+  profileListPageStart = 0;
+  populateProfileList();
+  sendNextionCommand("page profile1");
+  profilePageNeedsPopulate = false;
+}
+
+void handleNextionProfileTouchEvents()
+{
+  while (Serial2.available() >= 7)
+  {
+    if (Serial2.peek() != 0x65)
+    {
+      return;
+    }
+
+    uint8_t packet[7];
+    size_t bytesRead = Serial2.readBytes(packet, sizeof(packet));
+    if (bytesRead != sizeof(packet))
+    {
+      return;
+    }
+
+    if (packet[4] != 0xFF || packet[5] != 0xFF || packet[6] != 0xFF)
+    {
+      continue;
+    }
+
+    uint8_t pageId = packet[1];
+    uint8_t componentId = packet[2];
+    uint8_t eventType = packet[3];
+
+    if (componentId >= PROFILE_TOUCH_COMPONENT_ID_MIN &&
+        componentId <= PROFILE_TOUCH_COMPONENT_ID_MAX &&
+        eventType == 0)
+    {
+      profileSelectionPageId = pageId;
+      handleProfileSelection(componentId - PROFILE_TOUCH_COMPONENT_ID_MIN);
+    }
+  }
+}
+
+// Optional EasyNextion trigger hook for opening the profile page.
+// Can be bound in HMI with: printh 23 02 54 32
+void trigger50()
+{
+  showProfileSelection();
 }
 
 float predictedFinalWeight(float flow, float pressure)
@@ -1120,22 +1324,7 @@ void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float
 
 void updateProfileSelectUi()
 {
-  int maxIndex = (profileCount > 0) ? profileCount - 1 : 0;
-  int currentIndex = (selectedProfileIndex < 0) ? 0 : selectedProfileIndex;
-  if (currentIndex >= profileCount)
-    currentIndex = maxIndex;
-
-  Serial.print("[DEBUG] updateProfileSelectUi - profileCount:"); Serial.print(profileCount);
-  Serial.print(" maxIndex:"); Serial.print(maxIndex);
-  Serial.print(" currentIndex:"); Serial.println(currentIndex);
-  
-  // NOTE: profileMax and selectedProfile may not exist in HMI as global variables
-  // Check if these are defined in your Nextion display!
-  myNex.writeNum("profileMax", maxIndex);
-  Serial.print("[DEBUG] Sent profileMax="); Serial.println(maxIndex);
-  
-  myNex.writeNum("selectedProfile", currentIndex);
-  Serial.print("[DEBUG] Sent selectedProfile="); Serial.println(currentIndex);
+  populateProfileList();
 }
 
 void updateProfileModeText()
@@ -1525,15 +1714,16 @@ void readSettigs()
 {
   if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive && !pendingObservation)
   {
-    int previousProfileCount = profileCount;
-    if (sdReady)
+    if (sdReady && (millis() - lastProfileScanMs >= PROFILE_SCAN_INTERVAL_MS))
     {
+      int previousProfileCount = profileCount;
       scanProfiles();
+      lastProfileScanMs = millis();
       if (previousProfileCount != profileCount)
       {
         Serial.print("[DEBUG] Profile count changed: "); Serial.print(previousProfileCount);
         Serial.print(" -> "); Serial.println(profileCount);
-        updateProfileSelectUi();
+        populateProfileList();
       }
     }
 
@@ -1542,55 +1732,22 @@ void readSettigs()
     // Read Nextion variables (only log if values change)
     static int lastPPEnabled = -1;
     static int lastRemoteEnabled = -1;
-    static int lastSelectedProfile = -1;
     
     // readNumber() returns -1 on timeout/error. Guard: only accept 0 or 1.
     int rawPP = myNex.readNumber("pPEnabled");
     if (rawPP >= 0) pressureProfilingEnabled = (rawPP != 0);
     int rawRemote = myNex.readNumber("remoteEnabled");
     if (rawRemote >= 0) remoteProfilingEnabled = (rawRemote != 0);
-
-    // NOTE: selectedProfile variable may not exist in HMI!
-    int idx = myNex.readNumber("selectedProfile");
-
-    // Clamp to valid range. Guard against profileCount==0 which makes
-    // the upper clamp produce -1 (profileCount-1 = -1).
-    if (profileCount <= 0)
-    {
-      idx = 0;  // no profiles loaded yet — nothing to select
-    }
-    else
-    {
-      if (idx < 0) idx = 0;
-      if (idx >= profileCount) idx = profileCount - 1;
-    }
     
     // Only log if settings actually changed
     if (pressureProfilingEnabled != lastPPEnabled || 
-        remoteProfilingEnabled != lastRemoteEnabled || 
-        idx != lastSelectedProfile)
+        remoteProfilingEnabled != lastRemoteEnabled)
     {
       Serial.print("[DEBUG] Settings changed - pPEnabled:"); Serial.print(pressureProfilingEnabled);
-      Serial.print(" remoteEnabled:"); Serial.print(remoteProfilingEnabled);
-      Serial.print(" selectedProfile:"); Serial.println(idx);
+      Serial.print(" remoteEnabled:"); Serial.println(remoteProfilingEnabled);
       
       lastPPEnabled = pressureProfilingEnabled;
       lastRemoteEnabled = remoteProfilingEnabled;
-      lastSelectedProfile = idx;
-    }
-
-    // Remote profiling: use selected profile from SD card
-    bool usePresetProfile = pressureProfilingEnabled && remoteProfilingEnabled && sdReady && idx >= 0 && idx < profileCount;
-    if (usePresetProfile && idx != selectedProfileIndex)
-    {
-      selectedProfileIndex = idx;
-      if (loadProfile(profileNames[selectedProfileIndex]))
-      {
-        loadBeta();
-        loadObservations();
-        myNex.writeStr("actProfile.txt", activeProfileName);
-        // Target weight comes from loaded profile
-      }
     }
     
     // Manual mode (pressure profiling ON, remote OFF): read manual pressure settings
@@ -1689,7 +1846,18 @@ void updateDisplay()
 
     if (currentPageId != lastPageId)
     {
+      if (currentPageId == (uint32_t)profileSelectionPageId || currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId))
+      {
+        profilePageNeedsPopulate = true;
+      }
       lastPageId = currentPageId;
+    }
+
+    if (profilePageNeedsPopulate &&
+        (currentPageId == (uint32_t)profileSelectionPageId || currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId)))
+    {
+      populateProfileList();
+      profilePageNeedsPopulate = false;
     }
 
     // Always write all values - page checks removed for simplicity
