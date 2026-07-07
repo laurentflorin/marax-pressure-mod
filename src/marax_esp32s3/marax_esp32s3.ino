@@ -145,6 +145,8 @@ bool selectProfile(int profileIndex);
 void handleNextionProfileTouchEvents();
 void loadPersistedProfileSelection();
 void persistSelectedProfile();
+void loadPersistedTargetWeight();
+void persistTargetWeight();
 bool loadProfile(const char *filename);
 void loadBeta();
 void loadObservations();
@@ -574,6 +576,7 @@ void setup()
 
   preferences.begin("marax", false);
   loadPersistedProfileSelection();
+  loadPersistedTargetWeight();
 
   // Serial Marax
   memset(receivedCharsFromMarax, 0, numCharsSerialMarax);
@@ -687,6 +690,8 @@ void setup()
     
     myNex.writeStr("actProfile.txt", activeProfileName);
     Serial.println("[DEBUG] Sent actProfiletxt.txt");
+    myNex.writeNum("targetWeight", (int)targetWeight);
+    Serial.print("[DEBUG] Restored targetWeight: "); Serial.println((int)targetWeight);
     
     populateProfileList();
     updateProfileModeText();
@@ -844,6 +849,23 @@ void persistSelectedProfile()
     return;
   }
   preferences.putString("selected_file", profileNames[selectedProfileIndex]);
+}
+
+void loadPersistedTargetWeight()
+{
+  float savedTargetWeight = preferences.getFloat("target_weight", targetWeight);
+  if (savedTargetWeight > 0.0f)
+  {
+    targetWeight = savedTargetWeight;
+  }
+}
+
+void persistTargetWeight()
+{
+  if (targetWeight > 0.0f)
+  {
+    preferences.putFloat("target_weight", targetWeight);
+  }
 }
 
 void populateProfileList()
@@ -1121,7 +1143,6 @@ bool loadProfile(const char *filename)
       t4t = atoi(token);
       break;
     case 9:
-      targetWeight = atof(token);
       break;
     }
     idx++;
@@ -1784,9 +1805,9 @@ void readSettigs()
       t4t = myNex.readNumber("t4t");
     }
     
-    // When remote profiling is OFF, display targetWeight is always authoritative
-    if (!remoteProfilingEnabled)
+    // targetWeight is always authoritative from the display selector.
     {
+      static int lastPersistedTargetWeight = -1;
       int manualTargetWeight = myNex.readNumber("targetWeight");
       if (manualTargetWeight >= 0)
       {
@@ -1795,7 +1816,12 @@ void readSettigs()
           Serial.print("[DEBUG] Target weight changed: "); Serial.print(targetWeight);
           Serial.print("g -> "); Serial.print(manualTargetWeight); Serial.println("g");
         }
-        targetWeight = (float)manualTargetWeight;  // Always sync from display
+        targetWeight = (float)manualTargetWeight;
+        if (manualTargetWeight != lastPersistedTargetWeight)
+        {
+          persistTargetWeight();
+          lastPersistedTargetWeight = manualTargetWeight;
+        }
       }
     }
 
