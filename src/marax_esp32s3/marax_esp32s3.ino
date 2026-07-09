@@ -235,8 +235,8 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define PROFILE_FIELD_COUNT 10
 #define PROFILE_CSV_BUFFER_LEN 128
 #define WEIGHT_STABLE_WINDOW_MS 5000  // how long weight must be stable before committing observation
-#define WEIGHT_STABLE_THRESHOLD 0.2f  // max increase (g) over stability window
-#define OBSERVATION_MAX_WAIT_MS 30000 // max time to wait for stability after brew stop
+#define WEIGHT_STABLE_THRESHOLD 0.5f  // max increase (g) over stability window
+#define OBSERVATION_MAX_WAIT_MS 10000 // max time to wait for stability after brew stop
 #define MIN_VALID_FINAL_WEIGHT 5.0f
 #define MAX_VALID_EXTRA_WEIGHT 15.0f
 #define OLS_SINGULARITY_THRESHOLD 1e-10
@@ -260,7 +260,9 @@ unsigned long lastScaleReconnectAttemptMs = 0;
 const unsigned long SCALE_RECONNECT_INTERVAL_MS = 30000;  // 30 seconds between scan attempts
 
 #define OLS_WINDOW 30
-const float DEFAULT_OLS_BETA[5] = {3.5f, 1.2f, 0.1f, 0.1f, 0.1f};
+#define GLOBAL_BETA_PATH "/models/global_beta.csv"
+#define GLOBAL_DATA_PATH "/models/global_data.csv"
+const float DEFAULT_OLS_BETA[5] = {0.0f, 0.6f, 0.0f, 0.0f, 0.0f};
 float olsBeta[5] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2], DEFAULT_OLS_BETA[3], DEFAULT_OLS_BETA[4]};
 float olsX[OLS_WINDOW][2];
 float olsY[OLS_WINDOW];
@@ -758,7 +760,7 @@ const char *toCharArray(const String &str)
 
 float predictedFinalWeight(float flow, float pressure)
 {
-  return currentWeight + olsBeta[0] + olsBeta[1] * flow + olsBeta[2] * pressure + olsBeta[3] * flow * pressure + olsBeta[4] * pressure * pressure;
+  return currentWeight + olsBeta[0] + olsBeta[1] * flow + olsBeta[2] * pressure + olsBeta[3] * flow * pressure + olsBeta[4] * flow * flow;
 }
 
 void fitOLS()
@@ -775,7 +777,7 @@ void fitOLS()
   {
     double flow = (double)olsX[i][0];
     double pressure = (double)olsX[i][1];
-    double row[5] = {1.0, flow, pressure, flow * pressure, pressure * pressure};
+    double row[5] = {1.0, flow, pressure, flow * pressure, flow * flow};
     for (int r = 0; r < 5; r++)
     {
       Xty[r] += row[r] * olsY[i];
@@ -939,9 +941,7 @@ void loadBeta()
     return;
   }
 
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
-  File f = SD.open(path);
+  File f = SD.open(GLOBAL_BETA_PATH);
   if (!f)
   {
     return;
@@ -964,10 +964,8 @@ void saveBeta()
     return;
   }
 
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/models/%s_beta.csv", activeProfileFileStem);
-  SD.remove(path);
-  File f = SD.open(path, FILE_WRITE);
+  SD.remove(GLOBAL_BETA_PATH);
+  File f = SD.open(GLOBAL_BETA_PATH, FILE_WRITE);
   if (!f)
   {
     return;
@@ -990,9 +988,7 @@ void loadObservations()
     return;
   }
 
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
-  File f = SD.open(path);
+  File f = SD.open(GLOBAL_DATA_PATH);
   if (!f)
   {
     return;
@@ -1066,10 +1062,8 @@ void saveObservation(float flow, float pres, float extra)
     return;
   }
 
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/models/%s_data.csv", activeProfileFileStem);
-  bool exists = SD.exists(path);
-  File f = SD.open(path, FILE_WRITE);
+  bool exists = SD.exists(GLOBAL_DATA_PATH);
+  File f = SD.open(GLOBAL_DATA_PATH, FILE_WRITE);
   if (!f)
   {
     return;
@@ -1085,6 +1079,63 @@ void saveObservation(float flow, float pres, float extra)
   f.print(",");
   f.println(extra, 4);
   f.close();
+}
+
+void startPendingObservation(float flowAtStop, float pressAtStop)
+{
+  if (!scaleConnected || lastWeightTime == 0)
+  {
+    pendingObservation = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  pendingObservation = true;
+  pendingObsTime = now;
+  pendingFlowAtStop = flowAtStop;
+  pendingPressAtStop = pressAtStop;
+  pendingWeightAtStop = currentWeight;
+  pendingStabilityCheckWeight = currentWeight;
+  pendingStabilityCheckTime = now;
+  pendingBrewTimeS = (int)((now - activeBrewingStart) / 1000);
+}
+
+void finalizePendingObservation(float finalWeight, bool allowModelUpdate)
+{
+  pendingObservation = false;
+
+  float extraWeight = finalWeight - pendingWeightAtStop;
+
+  bool validForModel = true;
+  if (extraWeight < 0.0f || extraWeight > MAX_VALID_EXTRA_WEIGHT)
+  {
+    validForModel = false;
+  }
+  if (finalWeight < MIN_VALID_FINAL_WEIGHT)
+  {
+    validForModel = false;
+  }
+
+  if (allowModelUpdate && validForModel)
+  {
+    int slot = olsWriteIndex;
+    olsX[slot][0] = pendingFlowAtStop;
+    olsX[slot][1] = pendingPressAtStop;
+    olsY[slot] = extraWeight;
+
+    if (olsCount < OLS_WINDOW)
+    {
+      olsCount++;
+    }
+    olsWriteIndex = (olsWriteIndex + 1) % OLS_WINDOW;
+
+    fitOLS();
+    saveBeta();
+    saveObservation(pendingFlowAtStop, pendingPressAtStop, extraWeight);
+  }
+
+  // Always save the brew log once an observation window was started.
+  saveBrewLog(finalWeight, pendingBrewTimeS, pendingFlowAtStop, pendingPressAtStop, extraWeight);
 }
 
 void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float extra)
@@ -1388,7 +1439,9 @@ void checkPendingObservation()
   unsigned long now = millis();
   if (now - pendingObsTime >= OBSERVATION_MAX_WAIT_MS)
   {
-    pendingObservation = false;
+    // Timeout reached with unstable weight: keep the brew record using the
+    // current reading as finalWeight and include it in OLS training.
+    finalizePendingObservation(currentWeight, true);
     return;
   }
 
@@ -1404,35 +1457,8 @@ void checkPendingObservation()
     return;
   }
 
-  pendingObservation = false;
-
-  float finalWeight = currentWeight;
-  float extraWeight = finalWeight - pendingWeightAtStop;
-
-  if (extraWeight < 0.0f || extraWeight > MAX_VALID_EXTRA_WEIGHT)
-  {
-    return;
-  }
-  if (finalWeight < MIN_VALID_FINAL_WEIGHT)
-  {
-    return;
-  }
-
-  int slot = olsWriteIndex;
-  olsX[slot][0] = pendingFlowAtStop;
-  olsX[slot][1] = pendingPressAtStop;
-  olsY[slot] = extraWeight;
-
-  if (olsCount < OLS_WINDOW)
-  {
-    olsCount++;
-  }
-  olsWriteIndex = (olsWriteIndex + 1) % OLS_WINDOW;
-
-  fitOLS();
-  saveBeta();
-  saveObservation(pendingFlowAtStop, pendingPressAtStop, extraWeight);
-  saveBrewLog(finalWeight, pendingBrewTimeS, pendingFlowAtStop, pendingPressAtStop, extraWeight);
+  // Stable within the configured window: accept this as final and train model.
+  finalizePendingObservation(currentWeight, true);
 }
 
 // Gets "live" Info during brew
@@ -1797,6 +1823,11 @@ void pressureProfile()
       float predicted = predictedFinalWeight(flowRate, getPressure());
       if (predicted >= targetWeight)
       {
+        // Start stability window from the exact moment target stop is triggered.
+        if (!pendingObservation)
+        {
+          startPendingObservation(flowRate, getPressure());
+        }
         targetWeightReached = true;
         setPumpBrightness(0);
         myNex.writeNum("n0.pco", 1535);
@@ -2134,17 +2165,17 @@ void brewTimer(bool start)
       float weightAtStop = currentWeight;
       float flowAtStop = flowRate;
       float pressAtStop = getPressure();
-      unsigned long now = millis();
 
-      if (scaleConnected && lastWeightTime > 0)
+      // If target-weight stop already started pending observation, keep its
+      // start time so the stability window reflects pump-off timing.
+      if (pendingObservation)
       {
-        pendingObservation = true;
-        pendingObsTime = now;
-        pendingFlowAtStop = flowAtStop;
-        pendingPressAtStop = pressAtStop;
+        pendingBrewTimeS = brewSecs;
+      }
+      else if (scaleConnected && lastWeightTime > 0)
+      {
+        startPendingObservation(flowAtStop, pressAtStop);
         pendingWeightAtStop = weightAtStop;
-        pendingStabilityCheckWeight = weightAtStop;
-        pendingStabilityCheckTime = now;
         pendingBrewTimeS = brewSecs;
       }
       else
