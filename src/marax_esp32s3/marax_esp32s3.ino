@@ -147,6 +147,8 @@ void loadPersistedProfileSelection();
 void persistSelectedProfile();
 void loadPersistedTargetWeight();
 void persistTargetWeight();
+void updateTargetWeightUi(bool force);
+void updateProfileSelectionHighlight();
 bool loadProfile(const char *filename);
 void loadBeta();
 void loadObservations();
@@ -252,10 +254,11 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define PROFILE_ROWS_PER_PAGE 10
 #define PROFILE_TOUCH_COMPONENT_ID_MIN 5
 #define PROFILE_TOUCH_COMPONENT_ID_MAX 14
-#define PROFILE_PAGE_ID_FALLBACK 1
-#define WEIGHT_STABLE_WINDOW_MS 5000  // how long weight must be stable before committing observation
+// Fallback page ID for `profile1` (matches page order in MaraxDisplayFile.HMI).
+#define PROFILE_PAGE_ID_FALLBACK 4
+#define WEIGHT_STABLE_WINDOW_MS 2000  // how long weight must be stable before committing observation
 #define WEIGHT_STABLE_THRESHOLD 0.5f  // max increase (g) over stability window
-#define OBSERVATION_MAX_WAIT_MS 10000 // max time to wait for stability after brew stop
+#define OBSERVATION_MAX_WAIT_MS 5000 // max time to wait for stability after brew stop
 #define MIN_VALID_FINAL_WEIGHT 5.0f
 #define MAX_VALID_EXTRA_WEIGHT 15.0f
 #define OLS_SINGULARITY_THRESHOLD 1e-10
@@ -659,6 +662,8 @@ void setup()
 
     scanProfiles();
     lastProfileScanMs = millis();
+    loadBeta();
+    loadObservations();
 
     if (profileCount > 0)
     {
@@ -692,7 +697,7 @@ void setup()
     
     myNex.writeStr("actProfile.txt", activeProfileName);
     Serial.println("[DEBUG] Sent actProfiletxt.txt");
-    myNex.writeNum("targetWeight", (int)targetWeight);
+    updateTargetWeightUi(true);
     Serial.print("[DEBUG] Restored targetWeight: "); Serial.println((int)targetWeight);
     
     populateProfileList();
@@ -731,7 +736,6 @@ void loop()
   checkPendingObservation();
 
   handleNextionProfileTouchEvents();
-  myNex.NextionListen();
 
   getMaschineInput();
   updateDisplay();
@@ -870,6 +874,80 @@ void persistTargetWeight()
   }
 }
 
+void updateTargetWeightUi(bool force)
+{
+  static int lastSentTargetWeight = -1;
+  static bool lastWasProfilePage = false;
+  int value = (int)targetWeight;
+
+  bool onProfilePage =
+      currentPageId == (uint32_t)profileSelectionPageId ||
+      currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId);
+
+  if (!force && value == lastSentTargetWeight && onProfilePage == lastWasProfilePage)
+  {
+    return;
+  }
+
+  myNex.writeNum("targetWeight", value);
+
+  if (onProfilePage)
+  {
+    sendNextionCommand("ntargetW.val=" + String(value));
+  }
+
+  lastSentTargetWeight = value;
+  lastWasProfilePage = onProfilePage;
+}
+
+bool isProfileSelectionPage(uint32_t pageId)
+{
+  return pageId == (uint32_t)profileSelectionPageId ||
+         pageId == (uint32_t)(0xFF000000 | profileSelectionPageId);
+}
+
+void syncTargetWeightFromDisplay()
+{
+  static int lastPersistedTargetWeight = -1;
+  int manualTargetWeight = myNex.readNumber("targetWeight");
+
+  // Guard against invalid readNumber() responses and out-of-range values.
+  if (manualTargetWeight < 1 || manualTargetWeight > 150)
+  {
+    return;
+  }
+
+  if (manualTargetWeight != (int)targetWeight)
+  {
+    Serial.print("[DEBUG] Target weight changed: "); Serial.print(targetWeight);
+    Serial.print("g -> "); Serial.print(manualTargetWeight); Serial.println("g");
+    targetWeight = (float)manualTargetWeight;
+  }
+
+  updateTargetWeightUi(false);
+
+  if (manualTargetWeight != lastPersistedTargetWeight)
+  {
+    persistTargetWeight();
+    lastPersistedTargetWeight = manualTargetWeight;
+  }
+}
+
+void updateProfileSelectionHighlight()
+{
+  for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
+  {
+    int profileIndex = profileListPageStart + row;
+    String component = "profile1.t" + String(row);
+    if (profileIndex >= 0 && profileIndex < profileCount)
+    {
+      sendNextionCommand(component + ".style=border");
+      sendNextionCommand(component + ".borderw=" + String((profileIndex == selectedProfileIndex) ? 3 : 2));
+      sendNextionCommand(component + ".borderc=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
+    }
+  }
+}
+
 void populateProfileList()
 {
   for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
@@ -889,13 +967,14 @@ void populateProfileList()
       sendNextionCommand(component + ".vis=1");
       sendNextionCommand(component + ".pco=65535");
       sendNextionCommand(component + ".bco=8518");
-      sendNextionCommand(component + ".borderc=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
     }
     else
     {
       sendNextionCommand(component + ".vis=0");
     }
   }
+
+  updateProfileSelectionHighlight();
 }
 
 bool selectProfile(int profileIndex)
@@ -911,12 +990,10 @@ bool selectProfile(int profileIndex)
   }
 
   selectedProfileIndex = profileIndex;
-  loadBeta();
-  loadObservations();
   myNex.writeStr("actProfile.txt", activeProfileName);
   updateProfileModeText();
   persistSelectedProfile();
-  populateProfileList();
+  updateProfileSelectionHighlight();
   return true;
 }
 
@@ -938,17 +1015,31 @@ void showProfileSelection()
     scanProfiles();
     lastProfileScanMs = millis();
   }
+
   profileListPageStart = 0;
-  populateProfileList();
+
   sendNextionCommand("page profile1");
+
+  delay(50);   // test with 50-100 ms first
+
+  populateProfileList();
+
   profilePageNeedsPopulate = false;
 }
-
 void handleNextionProfileTouchEvents()
 {
-  while (Serial2.available() >= 7)
+  static uint8_t handledPressComponentId = 0xFF;
+
+  while (Serial2.available() >= 1)
   {
     if (Serial2.peek() != 0x65)
+    {
+      // Discard non-touch bytes so touch packets queued behind them are parsed.
+      Serial2.read();
+      continue;
+    }
+
+    if (Serial2.available() < 7)
     {
       return;
     }
@@ -969,12 +1060,40 @@ void handleNextionProfileTouchEvents()
     uint8_t componentId = packet[2];
     uint8_t eventType = packet[3];
 
-    if (componentId >= PROFILE_TOUCH_COMPONENT_ID_MIN &&
-        componentId <= PROFILE_TOUCH_COMPONENT_ID_MAX &&
-        eventType == 0)
+    bool isProfileRowTouch =
+        componentId >= PROFILE_TOUCH_COMPONENT_ID_MIN &&
+        componentId <= PROFILE_TOUCH_COMPONENT_ID_MAX;
+
+    bool isProfilePageEvent =
+        pageId == (uint8_t)profileSelectionPageId ||
+        pageId == (uint8_t)PROFILE_PAGE_ID_FALLBACK;
+
+    if (!isProfileRowTouch || !isProfilePageEvent)
     {
+      continue;
+    }
+
+    int rowIndex = componentId - PROFILE_TOUCH_COMPONENT_ID_MIN;
+
+    // Some HMI objects are configured to send press events, others release.
+    // Handle both edges while suppressing duplicate handling on release.
+    if (eventType == 1)
+    {
+      handledPressComponentId = componentId;
       profileSelectionPageId = pageId;
-      handleProfileSelection(componentId - PROFILE_TOUCH_COMPONENT_ID_MIN);
+      handleProfileSelection(rowIndex);
+    }
+    else if (eventType == 0)
+    {
+      if (handledPressComponentId == componentId)
+      {
+        handledPressComponentId = 0xFF;
+        continue;
+      }
+
+      handledPressComponentId = 0xFF;
+      profileSelectionPageId = pageId;
+      handleProfileSelection(rowIndex);
     }
   }
 }
@@ -983,7 +1102,7 @@ void handleNextionProfileTouchEvents()
 // Can be bound in HMI with: printh 23 02 54 32
 void trigger50()
 {
-  showProfileSelection();
+  //showProfileSelection();
 }
 
 float predictedFinalWeight(float flow, float pressure)
@@ -1833,25 +1952,8 @@ void readSettigs()
       t4t = myNex.readNumber("t4t");
     }
     
-    // targetWeight is always authoritative from the display selector.
-    {
-      static int lastPersistedTargetWeight = -1;
-      int manualTargetWeight = myNex.readNumber("targetWeight");
-      if (manualTargetWeight >= 0)
-      {
-        if (manualTargetWeight != (int)targetWeight)
-        {
-          Serial.print("[DEBUG] Target weight changed: "); Serial.print(targetWeight);
-          Serial.print("g -> "); Serial.print(manualTargetWeight); Serial.println("g");
-        }
-        targetWeight = (float)manualTargetWeight;
-        if (manualTargetWeight != lastPersistedTargetWeight)
-        {
-          persistTargetWeight();
-          lastPersistedTargetWeight = manualTargetWeight;
-        }
-      }
-    }
+    // targetWeight is authoritative from display input when available.
+    syncTargetWeightFromDisplay();
 
     updateProfileModeText();
     readSettigsRefreshTimer = millis();
@@ -1891,16 +1993,21 @@ void updateDisplay()
     myNex.writeNum("steamTemp", steamTemp);
     myNex.writeStr("actProfile.txt", activeProfileName);
     updateProfileModeText();
-    // NOTE: targetWeight variable may not exist in HMI!
-    myNex.writeNum("targetWeight", (int)targetWeight);
     
     updateScaleConnectionUi();
 
     currentPageId = myNex.readNumber("dp");
 
+    if (isProfileSelectionPage(currentPageId))
+    {
+      // Keep MCU targetWeight synchronized from profile page selector.
+      syncTargetWeightFromDisplay();
+      updateTargetWeightUi(false);
+    }
+
     if (currentPageId != lastPageId)
     {
-      if (currentPageId == (uint32_t)profileSelectionPageId || currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId))
+      if (isProfileSelectionPage(currentPageId))
       {
         profilePageNeedsPopulate = true;
       }
@@ -1908,7 +2015,7 @@ void updateDisplay()
     }
 
     if (profilePageNeedsPopulate &&
-        (currentPageId == (uint32_t)profileSelectionPageId || currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId)))
+        isProfileSelectionPage(currentPageId))
     {
       populateProfileList();
       profilePageNeedsPopulate = false;
