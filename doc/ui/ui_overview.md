@@ -1,49 +1,42 @@
-
 # A overview of the different UI pages
 
 ## Home page
 
-![HomePage](/assets/home_page_with_details.jpg)
+The home page displays the brew and steam temperature, further the bluetooth sign shows if the Felicita Arc scale is connected.
 
+![HomePage_no_scale](/assets/home_scale_not_connected.jpg)
+![HomePage_scale](/assets/home_scale_connected.jpg)
+
+
+By touching the right top icon the settings page can be reached. By touching the coffe cup icon the brew page is opened.
+## Settings Page
+
+![Settings](/assets/settings.jpg)
+
+On the settings page the other pages can be reached. As well as the pressure profiling and remote profile can be activated. For the use of preset profiles, both have to be activated.
 
 ## Brew graph page
 
-![BrewGraph](/assets/brew_graph_with_details.jpg)
+![BrewGraph](/assets/brew_page.jpg)
 
 The brew graph page will automatically be shown if the brew leaver it switched to the "on/top" postion
 
 ## Cleaning Page
 
-![CleaningPage](/assets/cleaning_page_with_details.jpg)
+![CleaningPage](/assets/clean_page.jpg)
 
 If the cleaning page is active, it will count the shot time of the cleaning flush as well as the current amount of flushes that have been done.
 
-## Settings Page
+## Pressure Profile Selection Page
 
-![Settings](/assets/settings_page_with_details.jpg)
+![PP_Page](/assets/profile_selection.jpg)
 
-\* Read `Further ideas`, (This is implanted in the current version and will taken 50 points in `;` separated values.)
-When Pressure Profiling is disabled the machine will do a normal shot, but will show a graph and infos about the brew.
+On this page the desired preset profile can be chosen as well as the target output weight. 
 
-## Pressure Profile Page
+## Manual Pressure Profile Selection 
 
-![PP_Page](/assets/pp_page_with_details.jpg)
-
-The Pressure Profile that can be set. There a four time slots which can each have different pressures set. 
+![PP_Page_manual](/assets/manual_profile.jpg)
+Here a manual pressure profile can be set up. To use the manual profile Remote profile has top be switched off.
+The Pressure Profile that can be set. There a four time slots which can each have different pressures set.
 Example Shot -> 5 Bar for 5 Sec. then 6 Bar for 6 Sec. then 7 Bar for 5 Sec. then 8 Bar for 3 Sec.
 
-## Splash Screen/Page
-
-![Boot_Page](/assets/boot_screen.jpg)
-LELIT with added <3
-
-## Temperature imported in Home Assistant
-
-![HA](/assets/ha_temps.png)
-
-# Building the UI 
-
-- The UI design was build using Figma and by using [feathericons](https://github.com/feathericons/feather)
-- The Screen then was then "programmed" with the Nexion editor.
-- The Screen does have its known controller and communicates with the Nano over a serial connection 
-- The Nexion Display file can be found under `/display`
