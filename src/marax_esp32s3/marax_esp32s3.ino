@@ -4,7 +4,7 @@
 // DISABLE WiFi to prevent radio conflicts with BLE
 // ESP32-S3 has only ONE 2.4GHz radio shared between WiFi and BLE
 // Disabling WiFi gives BLE full control for reliable scale connection
-#define DISABLE_WIFI_MQTT
+// #define DISABLE_WIFI_MQTT
 
 // ─────────────────────────────────────────────────────────────────────────
 // OTA (Over-The-Air firmware updates over WiFi)
@@ -102,6 +102,14 @@
 #define SD_SCK_PIN           12
 #define SD_MISO_PIN          13
 
+// Brew input/relay electrical behavior:
+// - BREW_SWITCH_ACTIVE_LOW=1 means GPIO reads LOW when lever is ON (default).
+// - BREW_RELAY_ACTIVE_HIGH=1 means GPIO HIGH energizes relay (default).
+// If your relay board is low-level-trigger, set BREW_RELAY_ACTIVE_HIGH to 0.
+#define BREW_SWITCH_ACTIVE_LOW 1
+#define BREW_RELAY_ACTIVE_HIGH 1
+#define BREW_SWITCH_DEBOUNCE_MS 35
+
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu Wifi and Bluetooth
 // nunununununununununununununununununununununununununununununun
@@ -154,6 +162,9 @@ void loadBeta();
 void loadObservations();
 void updateProfileModeText();
 void scanProfiles();
+bool readRawBrewSwitchOn();
+bool readDebouncedBrewSwitchOn();
+void writeBrewRelay(bool brewOn);
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -234,6 +245,10 @@ int cleaningShots = 0;
 int cleaningShotsWater = 0;
 
 int brewSwitchAnalogValue = 0;
+bool brewSwitchStableOn = false;
+bool brewSwitchLastRawOn = false;
+bool brewSwitchDebounceInitialized = false;
+unsigned long brewSwitchLastChangeMs = 0;
 
 uint32_t currentPageId;
 int lastPageId;
@@ -527,9 +542,20 @@ void setup()
 
   pinMode(BREW_SWITCH_PIN, INPUT_PULLUP);
   // Relay signals GiCar that brew switch is active (mirrors brew switch state)
-  // Deenergized (LOW) at startup = GiCar sees switch as OFF
+  // Startup forces logical brew OFF; electrical level depends on relay polarity setting.
   pinMode(BREW_RELAY_PIN, OUTPUT);
-  digitalWrite(BREW_RELAY_PIN, LOW);
+  writeBrewRelay(false);
+
+  // Prime lever debounce with current hardware level so first brew transition
+  // is edge-driven and not sensitive to switch contact bounce at startup.
+  brewSwitchStableOn = readRawBrewSwitchOn();
+  brewSwitchLastRawOn = brewSwitchStableOn;
+  brewSwitchDebounceInitialized = true;
+  brewSwitchLastChangeMs = millis();
+  Serial.print("[BREW] Switch polarity: ");
+  Serial.println(BREW_SWITCH_ACTIVE_LOW ? "LOW=ON" : "HIGH=ON");
+  Serial.print("[BREW] Relay polarity: ");
+  Serial.println(BREW_RELAY_ACTIVE_HIGH ? "HIGH=ON" : "LOW=ON");
 
   // Initialize SPI bus with custom pins for the SD card
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
@@ -2252,16 +2278,58 @@ void brewDetect()
 
 bool brewState()
 {
-  if (digitalRead(BREW_SWITCH_PIN) == LOW)
+  bool brewOn = readDebouncedBrewSwitchOn();
+  writeBrewRelay(brewOn);  // Signal GiCar: brew switch state
+  return brewOn;
+}
+
+bool readRawBrewSwitchOn()
+{
+#if BREW_SWITCH_ACTIVE_LOW
+  return digitalRead(BREW_SWITCH_PIN) == LOW;
+#else
+  return digitalRead(BREW_SWITCH_PIN) == HIGH;
+#endif
+}
+
+bool readDebouncedBrewSwitchOn()
+{
+  bool rawOn = readRawBrewSwitchOn();
+  unsigned long now = millis();
+
+  if (!brewSwitchDebounceInitialized)
   {
-    digitalWrite(BREW_RELAY_PIN, HIGH);   // Signal GiCar: brew switch ON (mirrors switch state)
-    return true;
+    brewSwitchDebounceInitialized = true;
+    brewSwitchLastRawOn = rawOn;
+    brewSwitchStableOn = rawOn;
+    brewSwitchLastChangeMs = now;
+    return brewSwitchStableOn;
   }
-  else
+
+  if (rawOn != brewSwitchLastRawOn)
   {
-    digitalWrite(BREW_RELAY_PIN, LOW);  // Signal GiCar: brew switch OFF
-    return false;
+    brewSwitchLastRawOn = rawOn;
+    brewSwitchLastChangeMs = now;
   }
+
+  if ((now - brewSwitchLastChangeMs) >= BREW_SWITCH_DEBOUNCE_MS &&
+      brewSwitchStableOn != rawOn)
+  {
+    brewSwitchStableOn = rawOn;
+    Serial.print("[BREW] Lever ");
+    Serial.println(brewSwitchStableOn ? "ON" : "OFF");
+  }
+
+  return brewSwitchStableOn;
+}
+
+void writeBrewRelay(bool brewOn)
+{
+#if BREW_RELAY_ACTIVE_HIGH
+  digitalWrite(BREW_RELAY_PIN, brewOn ? HIGH : LOW);
+#else
+  digitalWrite(BREW_RELAY_PIN, brewOn ? LOW : HIGH);
+#endif
 }
 
 // Mara X Machine Input Parser
