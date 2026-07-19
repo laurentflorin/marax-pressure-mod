@@ -165,6 +165,7 @@ void scanProfiles();
 bool readRawBrewSwitchOn();
 bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
+void resetPressureController();
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -364,6 +365,13 @@ bool boilerFullLatch = false;
 // Latch: once the predicted weight reaches target during a profiled brew,
 // keep the pump off until the brew ends (lever released)
 bool targetWeightReached = false;
+// The sigmoid term reacts quickly, while the integral trim removes
+// steady-state pressure sag during a flowing shot.
+const float pressureControlBiasBar = 1.7f;
+const float pressureControlIntegralGain = 20.0f;
+const float pressureControlIntegralMax = 120.0f;
+float pressureControlIntegral = 0.0f;
+unsigned long pressureControlLastUpdateMs = 0;
 volatile uint8_t  pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
 volatile uint32_t zeroCrossCount = 0;    // Incremented in ISR, read in debug
 hw_timer_t *acTimer = NULL;
@@ -2107,21 +2115,62 @@ void updateIdlePumpControl()
   // If latched and pressure is gone: stay at 0 until brew ends
 }
 
+void resetPressureController()
+{
+  pressureControlIntegral = 0.0f;
+  pressureControlLastUpdateMs = 0;
+}
+
 void setPressure(float targetValue)
 {
-  int pumpValue;
-  float currentPressure = (getPressure() - 1.7f);
+  if (targetValue <= 0.0f)
+  {
+    resetPressureController();
+    setPumpBrightness(0);
+    return;
+  }
 
-  if (targetValue == 0 || currentPressure > targetValue)
+  float currentPressure = getPressure() - pressureControlBiasBar;
+  float diff = targetValue - currentPressure;
+
+  unsigned long now = millis();
+  float dt = 0.0f;
+  if (pressureControlLastUpdateMs != 0 && now >= pressureControlLastUpdateMs)
   {
-    pumpValue = 0;
+    dt = (now - pressureControlLastUpdateMs) / 1000.0f;
+    if (dt > 0.25f)
+    {
+      dt = 0.25f;
+    }
   }
-  else
+  pressureControlLastUpdateMs = now;
+
+  if (dt > 0.0f)
   {
-    float diff = targetValue - currentPressure;
-    pumpValue = 255 / (1.f + exp(2.f - diff / 0.9f));
+    pressureControlIntegral += diff * pressureControlIntegralGain * dt;
+    if (pressureControlIntegral < 0.0f)
+    {
+      pressureControlIntegral = 0.0f;
+    }
+    else if (pressureControlIntegral > pressureControlIntegralMax)
+    {
+      pressureControlIntegral = pressureControlIntegralMax;
+    }
   }
-  setPumpBrightness(pumpValue);
+
+  if (diff <= 0.0f)
+  {
+    setPumpBrightness(0);
+    return;
+  }
+
+  float pumpValue = 255.0f / (1.0f + expf(2.0f - diff / 0.9f));
+  pumpValue += pressureControlIntegral;
+  if (pumpValue > 255.0f)
+  {
+    pumpValue = 255.0f;
+  }
+  setPumpBrightness((uint8_t)pumpValue);
 }
 
 void pressureProfile()
@@ -2137,6 +2186,13 @@ void pressureProfile()
       return;
     }
 
+    // Brew-by-weight auto-stop is only valid when a scale is connected and
+    // we have received at least one weight sample in this session.
+    bool brewByWeightActive =
+        scaleConnected &&
+        targetWeight > 0.0f &&
+        lastWeightTime > 0;
+
     // Target-weight latch: once the predicted final weight reaches target,
     // keep the pump off for the rest of this brew. Without this latch the
     // flow/pressure collapse after the pump stops drops the prediction back
@@ -2147,15 +2203,16 @@ void pressureProfile()
       return;
     }
 
-    if (scaleConnected && targetWeight > 0.0f)
+    if (brewByWeightActive)
     {
-      float predicted = predictedFinalWeight(flowRate, getPressure());
+      float pressureNow = getPressure();
+      float predicted = predictedFinalWeight(flowRate, pressureNow);
       if (predicted >= targetWeight)
       {
         // Start stability window from the exact moment target stop is triggered.
         if (!pendingObservation)
         {
-          startPendingObservation(flowRate, getPressure());
+          startPendingObservation(flowRate, pressureNow);
         }
         targetWeightReached = true;
         setPumpBrightness(0);
@@ -2198,8 +2255,43 @@ void pressureProfile()
     {
       myNex.writeNum("n0.pco", 1535);
       myNex.writeNum("n1.pco", 1535);
-      myNex.writeNum("setbar.val", 0);
-      setPumpBrightness(0);
+
+      if (brewByWeightActive)
+      {
+        // Existing behavior: with a connected scale, profile completion can
+        // still terminate pump flow automatically.
+        myNex.writeNum("setbar.val", 0);
+        setPumpBrightness(0);
+      }
+      else
+      {
+        // No scale: continue at the final profile pressure and let the user
+        // end the shot manually with the lever.
+        int holdPressure = t4p;
+        int holdWave = t4pWave;
+
+        if (t4t <= 0)
+        {
+          if (t3t > 0)
+          {
+            holdPressure = t3p;
+            holdWave = t3pWave;
+          }
+          else if (t2t > 0)
+          {
+            holdPressure = t2p;
+            holdWave = t2pWave;
+          }
+          else
+          {
+            holdPressure = t1p;
+            holdWave = t1pWave;
+          }
+        }
+
+        myNex.writeNum("setbar.val", holdWave);
+        setPressure(holdPressure);
+      }
     }
   }
 }
@@ -2241,6 +2333,7 @@ void brewDetect()
       myNex.writeNum("pBrew.pic", 25);
       brewActive = true;
       targetWeightReached = false;  // Fresh brew — clear the weight cut-off latch
+      resetPressureController();
 
       // Seed dimmer debug counters so the first ZC/s reading is not
       // inflated by zero-crossings accumulated since boot.
@@ -2265,6 +2358,7 @@ void brewDetect()
     {
       boilerFullLatch = false;      // Unlock idle control for next fill cycle
       targetWeightReached = false;  // Clear weight cut-off latch for next brew
+      resetPressureController();
       setPumpBrightness(255);       // Dimmer back to 100% — GiCar has full pump control
     }
 
