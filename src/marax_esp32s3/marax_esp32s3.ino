@@ -165,7 +165,6 @@ void scanProfiles();
 bool readRawBrewSwitchOn();
 bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
-void resetPressureController();
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -365,13 +364,6 @@ bool boilerFullLatch = false;
 // Latch: once the predicted weight reaches target during a profiled brew,
 // keep the pump off until the brew ends (lever released)
 bool targetWeightReached = false;
-// The sigmoid term reacts quickly, while the integral trim removes
-// steady-state pressure sag during a flowing shot.
-const float pressureControlBiasBar = 1.7f;
-const float pressureControlIntegralGain = 20.0f;
-const float pressureControlIntegralMax = 120.0f;
-float pressureControlIntegral = 0.0f;
-unsigned long pressureControlLastUpdateMs = 0;
 volatile uint8_t  pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
 volatile uint32_t zeroCrossCount = 0;    // Incremented in ISR, read in debug
 hw_timer_t *acTimer = NULL;
@@ -2115,62 +2107,21 @@ void updateIdlePumpControl()
   // If latched and pressure is gone: stay at 0 until brew ends
 }
 
-void resetPressureController()
-{
-  pressureControlIntegral = 0.0f;
-  pressureControlLastUpdateMs = 0;
-}
-
 void setPressure(float targetValue)
 {
-  if (targetValue <= 0.0f)
-  {
-    resetPressureController();
-    setPumpBrightness(0);
-    return;
-  }
+  int pumpValue;
+  float currentPressure = (getPressure() - 1.7f);
 
-  float currentPressure = getPressure() - pressureControlBiasBar;
-  float diff = targetValue - currentPressure;
-
-  unsigned long now = millis();
-  float dt = 0.0f;
-  if (pressureControlLastUpdateMs != 0 && now >= pressureControlLastUpdateMs)
+  if (targetValue == 0 || currentPressure > targetValue)
   {
-    dt = (now - pressureControlLastUpdateMs) / 1000.0f;
-    if (dt > 0.25f)
-    {
-      dt = 0.25f;
-    }
+    pumpValue = 0;
   }
-  pressureControlLastUpdateMs = now;
-
-  if (dt > 0.0f)
+  else
   {
-    pressureControlIntegral += diff * pressureControlIntegralGain * dt;
-    if (pressureControlIntegral < 0.0f)
-    {
-      pressureControlIntegral = 0.0f;
-    }
-    else if (pressureControlIntegral > pressureControlIntegralMax)
-    {
-      pressureControlIntegral = pressureControlIntegralMax;
-    }
+    float diff = targetValue - currentPressure;
+    pumpValue = 255 / (1.f + exp(2.f - diff / 0.9f));
   }
-
-  if (diff <= 0.0f)
-  {
-    setPumpBrightness(0);
-    return;
-  }
-
-  float pumpValue = 255.0f / (1.0f + expf(2.0f - diff / 0.9f));
-  pumpValue += pressureControlIntegral;
-  if (pumpValue > 255.0f)
-  {
-    pumpValue = 255.0f;
-  }
-  setPumpBrightness((uint8_t)pumpValue);
+  setPumpBrightness(pumpValue);
 }
 
 void pressureProfile()
@@ -2333,7 +2284,6 @@ void brewDetect()
       myNex.writeNum("pBrew.pic", 25);
       brewActive = true;
       targetWeightReached = false;  // Fresh brew — clear the weight cut-off latch
-      resetPressureController();
 
       // Seed dimmer debug counters so the first ZC/s reading is not
       // inflated by zero-crossings accumulated since boot.
@@ -2358,7 +2308,6 @@ void brewDetect()
     {
       boilerFullLatch = false;      // Unlock idle control for next fill cycle
       targetWeightReached = false;  // Clear weight cut-off latch for next brew
-      resetPressureController();
       setPumpBrightness(255);       // Dimmer back to 100% — GiCar has full pump control
     }
 
