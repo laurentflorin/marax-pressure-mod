@@ -42,12 +42,13 @@ private:
     NimBLEClient *pClient = nullptr;
     NimBLERemoteCharacteristic *pWriteChar = nullptr;
     NimBLERemoteCharacteristic *pNotifyChar = nullptr;
-    NimBLEAdvertisedDevice *pAdvertisedDevice = nullptr;
+    NimBLEScan *pScan = nullptr;
     
     String targetMAC;
     bool debug;
     bool connected = false;
     bool weightDataAvailable = false;
+    bool scanInProgress = false;
     
     float currentWeight = 0.0f;
     float battery = 0.0f;
@@ -55,6 +56,7 @@ private:
     unsigned long lastWeightUpdate = 0;
     
     static const uint32_t HEARTBEAT_INTERVAL_MS = 2000;  // Felicita doesn't need heartbeats but we use this to detect stale connection
+    static const uint32_t SCAN_DURATION_MS = 5000;
     
     // Store instance pointer for callback access
     static FelicitaScale_NimBLE *callbackInstance;
@@ -123,6 +125,48 @@ private:
         return true;
     }
 
+    bool ensureBleReady() {
+        static bool nimbleInitialized = false;
+
+        if (!nimbleInitialized) {
+            NimBLEDevice::init("MaraXController");
+            NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max power for all BLE operations (scan, connect, advertise)
+            nimbleInitialized = true;
+            if (debug) Serial.println("[SCALE] NimBLE initialized with max power");
+        }
+
+        if (!pScan) {
+            pScan = NimBLEDevice::getScan();
+            if (!pScan) {
+                if (debug) Serial.println("[SCALE] ERROR: Failed to get scan object!");
+                return false;
+            }
+        }
+
+        // NOTE: NimBLE v2.x uses milliseconds for interval/window (not 0.625ms units).
+        pScan->setActiveScan(true);
+        pScan->setInterval(100);
+        pScan->setWindow(100);
+        pScan->setDuplicateFilter(false);
+        return true;
+    }
+
+    bool isTargetDevice(const NimBLEAdvertisedDevice *device) {
+        if (!device) return false;
+
+        String deviceName = String(device->getName().c_str());
+        String deviceAddr = String(device->getAddress().toString().c_str());
+
+        if (targetMAC.length() > 0) {
+            return deviceAddr.equalsIgnoreCase(targetMAC);
+        }
+
+        return deviceName.indexOf("ACAIA") >= 0 ||
+               deviceName.indexOf("FELICITA") >= 0 ||
+               deviceName.indexOf("LUNAR") >= 0 ||
+               deviceName.indexOf("PYXIS") >= 0;
+    }
+
 public:
     FelicitaScale_NimBLE(bool enableDebug = false) : debug(enableDebug) {
         callbackInstance = this;  // Set static instance pointer for callbacks
@@ -137,26 +181,22 @@ public:
         }
     }
     
-    // Initialize and connect to scale
+    // Start a background connection attempt.
     // macAddress: BLE MAC address (e.g. "B0:10:A0:8E:81:67") or empty string for auto-discovery
-    bool init(const char *macAddress = "") {
+    bool beginConnect(const char *macAddress = "") {
         targetMAC = String(macAddress);
-        
+
+        if (isConnected()) {
+            connected = true;
+            return true;
+        }
+
+        if (connected) {
+            disconnect();
+        }
+
         if (debug) {
             Serial.println("[SCALE] Initializing NimBLE...");
-        }
-        
-        // Initialize NimBLE (only once)
-        static bool nimbleInitialized = false;
-        if (!nimbleInitialized) {
-            NimBLEDevice::init("MaraXController");
-            NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max power for all BLE operations (scan, connect, advertise)
-            nimbleInitialized = true;
-            if (debug) Serial.println("[SCALE] NimBLE initialized with max power");
-        }
-        
-        // Scan for scale
-        if (debug) {
             if (targetMAC.length() > 0) {
                 Serial.print("[SCALE] Scanning for MAC: ");
                 Serial.println(targetMAC);
@@ -164,44 +204,68 @@ public:
                 Serial.println("[SCALE] Auto-discovering Felicita/Acaia scale...");
             }
         }
-        
-        NimBLEScan *pScan = NimBLEDevice::getScan();
-        if (!pScan) {
-            if (debug) Serial.println("[SCALE] ERROR: Failed to get scan object!");
+
+        if (!ensureBleReady()) {
             return false;
         }
-        
-        // Configure scan parameters
-        // NOTE: NimBLE v2.x uses milliseconds for interval/window (not 0.625ms units)
-        // With WiFi disabled, use continuous scan (window == interval) for fastest discovery
-        pScan->setActiveScan(true);       // Active scan to get device names
-        pScan->setInterval(100);          // 100ms interval
-        pScan->setWindow(100);            // 100ms window = continuous scan (window == interval)
-        pScan->setDuplicateFilter(false); // Allow duplicate detections
-        
-        // IMPORTANT: In NimBLE v2.x, getResults(duration_ms) is the BLOCKING scan API.
-        // start(duration_ms) is async and returns immediately — DO NOT use start() here.
-        if (debug) Serial.println("[SCALE] Starting 15-second BLE scan (please wait)...");
-        
-        unsigned long scanStart = millis();
-        NimBLEScanResults results = pScan->getResults(15000);  // Blocking 15-second scan
-        unsigned long scanDuration = millis() - scanStart;
-        
+
+        if (pScan->isScanning()) {
+            scanInProgress = true;
+            return false;
+        }
+
+        pScan->clearResults();
+
         if (debug) {
-            Serial.print("[SCALE] Scan completed in ");
-            Serial.print(scanDuration);
-            Serial.print("ms, found ");
+            Serial.print("[SCALE] Starting ");
+            Serial.print(SCAN_DURATION_MS);
+            Serial.println("ms BLE scan in background...");
+        }
+
+        if (!pScan->start(SCAN_DURATION_MS, false, true)) {
+            if (debug) Serial.println("[SCALE] ERROR: Failed to start BLE scan");
+            scanInProgress = false;
+            return false;
+        }
+
+        scanInProgress = true;
+        return false;
+    }
+
+    bool init(const char *macAddress = "") {
+        return beginConnect(macAddress);
+    }
+
+    bool pollConnect() {
+        if (isConnected()) {
+            connected = true;
+            return true;
+        }
+
+        if (!scanInProgress || !pScan) {
+            return false;
+        }
+
+        if (pScan->isScanning()) {
+            return false;
+        }
+
+        scanInProgress = false;
+        NimBLEScanResults results = pScan->getResults();
+
+        if (debug) {
+            Serial.print("[SCALE] Background scan completed, found ");
             Serial.print(results.getCount());
             Serial.println(" devices:");
         }
-        
+
         for (int i = 0; i < results.getCount(); i++) {
             const NimBLEAdvertisedDevice *device = results.getDevice(i);
             if (!device) continue;
-            
+
             String deviceName = String(device->getName().c_str());
             String deviceAddr = String(device->getAddress().toString().c_str());
-            
+
             if (debug) {
                 Serial.print("[SCALE]   [");
                 Serial.print(i);
@@ -212,52 +276,62 @@ public:
                 Serial.print(" RSSI:");
                 Serial.println(device->getRSSI());
             }
-            
-            // Match by MAC if specified, otherwise match by name
-            bool isMatch = false;
-            if (targetMAC.length() > 0) {
-                // Case-insensitive MAC comparison
-                isMatch = (deviceAddr.equalsIgnoreCase(targetMAC));
-                if (debug && !isMatch) {
+
+            if (!isTargetDevice(device)) {
+                if (debug && targetMAC.length() > 0) {
                     Serial.print("[SCALE]       Comparing '");
                     Serial.print(deviceAddr);
                     Serial.print("' with target '");
                     Serial.print(targetMAC);
                     Serial.println("' - no match");
                 }
-            } else {
-                // Auto-discover: look for Acaia or Felicita scale names
-                isMatch = (deviceName.indexOf("ACAIA") >= 0 || 
-                          deviceName.indexOf("FELICITA") >= 0 ||
-                          deviceName.indexOf("LUNAR") >= 0 ||
-                          deviceName.indexOf("PYXIS") >= 0);
+                continue;
             }
-            
-            if (isMatch) {
-                if (debug) {
-                    Serial.print("[SCALE] Found: ");
-                    Serial.print(deviceName);
-                    Serial.print(" (");
-                    Serial.print(deviceAddr);
-                    Serial.println(")");
-                }
-                
-                // Connect to scale
-                return connectToScale(device);
+
+            if (debug) {
+                Serial.print("[SCALE] Found: ");
+                Serial.print(deviceName);
+                Serial.print(" (");
+                Serial.print(deviceAddr);
+                Serial.println(")");
             }
+
+            bool connectedNow = connectToScale(device);
+            pScan->clearResults();
+            return connectedNow;
         }
-        
+
+        pScan->clearResults();
         if (debug) {
             Serial.println("[SCALE] Scale not found");
         }
         return false;
     }
+
+    bool isConnectionAttemptInProgress() {
+        return scanInProgress || (pScan && pScan->isScanning());
+    }
+
+    void cancelPendingConnect() {
+        if (pScan && pScan->isScanning()) {
+            pScan->stop();
+        }
+        if (pScan) {
+            pScan->clearResults();
+        }
+        scanInProgress = false;
+    }
     
     // Connect to discovered scale
     bool connectToScale(const NimBLEAdvertisedDevice *device) {
+        if (pClient) {
+            disconnect();
+        }
+
         pClient = NimBLEDevice::createClient();
         if (!pClient->connect(device)) {
             if (debug) Serial.println("[SCALE] Connection failed");
+            disconnect();
             return false;
         }
         

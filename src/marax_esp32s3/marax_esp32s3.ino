@@ -165,6 +165,7 @@ void scanProfiles();
 bool readRawBrewSwitchOn();
 bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
+void resumeIdleBoilerFill();
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -181,8 +182,6 @@ void writeBrewRelay(bool brewOn);
 #define debug_topic              "marax/sensor/debug"
 #define shots_topic              "marax/sensor/shots"
 #define power_topic              "marax/sensor/power_state"
-#define remoteProfileEnabled_topic    "marax/sensor/pressureProfilingEnabled"
-#define pressureProfileEnabled_topic  "marax/sensor/remoteProfileEnabled"
 
 PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
 
@@ -236,8 +235,6 @@ float pressure;
 
 bool pressureProfilingEnabled = false;
 bool remoteProfilingEnabled = false;
-
-float remoteProfileArray[50];
 
 bool cleaningModeActive = 0;
 bool cleaningRunActive = 0;
@@ -425,6 +422,12 @@ void setPumpBrightness(uint8_t brightness) {
   }
 }
 
+void resumeIdleBoilerFill()
+{
+  boilerFullLatch = false;
+  setPumpBrightness(255);
+}
+
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu OTA (Over-The-Air Updates)
 // nunununununununununununununununununununununununununununununun
@@ -514,6 +517,13 @@ void handleOTA()
 // nunununununununununununununununununununununununununununununun
 void setup()
 {
+  // Force the GiCar brew input inactive as soon as the sketch starts.
+  // Preloading the output level before switching to OUTPUT avoids a boot
+  // pulse while the pin changes modes.
+  writeBrewRelay(false);
+  pinMode(BREW_RELAY_PIN, OUTPUT);
+  writeBrewRelay(false);
+
   // USB Serial for debugging — open Serial Monitor at 9600
   Serial.begin(9600);
   delay(1000);
@@ -521,10 +531,6 @@ void setup()
 
   // ESP32-S3 ADC is 12-bit (0–4095). Must set this before any analogRead().
   analogReadResolution(12);
-
-  // Set Marax Brew Switch Relay to off on startup
-  pinMode(BREW_RELAY_PIN, INPUT_PULLUP);
-  delay(20);
 
   // AC Dimming: Zero-cross interrupt and TRIAC control
   pinMode(PUMP_PIN, OUTPUT);
@@ -538,13 +544,11 @@ void setup()
   // Zero-cross interrupt — try CHANGE if RISING gives ~75 ZC/s instead of ~100
   attachInterrupt(digitalPinToInterrupt(AC_ZERO_CROSS_PIN), zeroCrossISR, CHANGE);
   
-  setPumpBrightness(255);  // Dimmer at 100% — GiCar decides whether pump runs
+  // Match the post-brew refill behavior on cold boot: give the GiCar full
+  // pump authority until idle pressure says the boiler is full.
+  resumeIdleBoilerFill();
 
   pinMode(BREW_SWITCH_PIN, INPUT_PULLUP);
-  // Relay signals GiCar that brew switch is active (mirrors brew switch state)
-  // Startup forces logical brew OFF; electrical level depends on relay polarity setting.
-  pinMode(BREW_RELAY_PIN, OUTPUT);
-  writeBrewRelay(false);
 
   // Prime lever debounce with current hardware level so first brew transition
   // is edge-driven and not sensitive to switch contact bounce at startup.
@@ -626,9 +630,11 @@ void setup()
     Serial.println("[DEBUG] Auto-discovering any Felicita/Acaia scale...");
   }
   
-  // Try to connect to scale BEFORE starting WiFi (best conditions for BLE)
-  scaleConnected = scale.init(SCALE_MAC_ADDRESS);
-  Serial.println(scaleConnected ? "[DEBUG] Scale connected" : "[DEBUG] Scale not found (will retry after WiFi starts)");
+  // Start scale discovery BEFORE WiFi so BLE gets the best radio conditions,
+  // but keep the scan in the background so brew handling is never blocked.
+  scale.beginConnect(SCALE_MAC_ADDRESS);
+  scaleConnected = scale.isConnected();
+  Serial.println(scaleConnected ? "[DEBUG] Scale connected" : "[DEBUG] Scale scan started in background");
   updateScaleConnectionUi();
   lastScaleReconnectAttemptMs = millis();
 
@@ -747,7 +753,6 @@ void setup()
 void loop()
 {
   updateScale();
-  tryReconnectScale();
 #ifndef DISABLE_WIFI_MQTT
   tryReconnectWifi();
   tryReconnectMqtt();
@@ -771,46 +776,16 @@ void loop()
 
   liveData();
   pressureProfile();
+  tryReconnectScale();
 
   refresh_timer = millis();
 }
 
 void callbackfun(char *topic, byte *payload, unsigned int length)
 {
-  String topicFromCallback = topic;
-  if (topicFromCallback == "marax/remoteProfile")
-  {
-    int payloadSize = (int)length;
-    char chars[payloadSize + 1]; // +1 for null terminator
-    memcpy(chars, payload, payloadSize);
-    chars[payloadSize] = '\0'; // null-terminate before any string operations
-
-    char temp[8]; // large enough for float strings like "-12.50"
-    int charTempIndex = 0;
-    int index = 0;
-    for (int i = 0; i <= payloadSize; i++) // include '\0' to flush last value
-    {
-      char c = chars[i];
-      if (c != ',' && c != '\0')
-      {
-        if (charTempIndex < (int)sizeof(temp) - 1) // prevent temp overflow
-        {
-          temp[charTempIndex] = c;
-          charTempIndex++;
-        }
-      }
-      else if (charTempIndex > 0) // flush accumulated number on ',' or end of string
-      {
-        temp[charTempIndex] = '\0'; // null-terminate before strtod
-        if (index < 50) // prevent remoteProfileArray out-of-bounds
-        {
-          remoteProfileArray[index] = strtod(temp, NULL);
-        }
-        charTempIndex = 0;
-        index++;
-      }
-    }
-  }
+  (void)topic;
+  (void)payload;
+  (void)length;
 }
 
 void updateMqtt()
@@ -1060,9 +1035,8 @@ void handleNextionProfileTouchEvents()
   {
     if (Serial2.peek() != 0x65)
     {
-      // Discard non-touch bytes so touch packets queued behind them are parsed.
-      Serial2.read();
-      continue;
+      // Leave non-touch bytes for EasyNextionLibrary readNumber()/responses.
+      return;
     }
 
     if (Serial2.available() < 7)
@@ -1605,7 +1579,22 @@ void updateScaleConnectionUi()
 
 void tryReconnectScale()
 {
+  if (brewActive || readRawBrewSwitchOn())
+  {
+    if (scale.isConnectionAttemptInProgress())
+    {
+      scale.cancelPendingConnect();
+      lastScaleReconnectAttemptMs = 0;
+    }
+    return;
+  }
+
   if (scaleConnected)
+  {
+    return;
+  }
+
+  if (scale.isConnectionAttemptInProgress())
   {
     return;
   }
@@ -1619,10 +1608,11 @@ void tryReconnectScale()
   lastScaleReconnectAttemptMs = now;
   
   // With WiFi disabled, BLE has full control of the radio
-  Serial.println("[DEBUG] Attempting BLE scale reconnection...");
+  Serial.println("[DEBUG] Starting background BLE scale scan...");
   
   // Reinitialize and reconnect to scale (auto-discovers if MAC is empty)
-  scaleConnected = scale.init(SCALE_MAC_ADDRESS);
+  scale.beginConnect(SCALE_MAC_ADDRESS);
+  scaleConnected = scale.isConnected();
   if (!scaleConnected)
   {
     flowRate = 0.0f;
@@ -1676,7 +1666,6 @@ void tryReconnectMqtt()
 
   if (mqttClient.connect("MaraXMod", mqtt_user, mqtt_password))
   {
-    mqttClient.subscribe("marax/remoteProfile");
   }
 #endif
 }
@@ -1751,6 +1740,22 @@ void scanProfiles()
 
 void updateScale()
 {
+  if (!scaleConnected && (brewActive || readRawBrewSwitchOn()))
+  {
+    if (scale.isConnectionAttemptInProgress())
+    {
+      scale.cancelPendingConnect();
+      lastScaleReconnectAttemptMs = 0;
+    }
+    return;
+  }
+
+  if (!scaleConnected && scale.pollConnect())
+  {
+    scaleConnected = true;
+    updateScaleConnectionUi();
+  }
+
   if (!scaleConnected)
   {
     return;
@@ -1758,6 +1763,7 @@ void updateScale()
 
   if (!scale.isConnected())
   {
+    scale.disconnect();
     scaleConnected = false;
     flowRate = 0.0f;
     updateScaleConnectionUi();
@@ -2110,7 +2116,7 @@ void updateIdlePumpControl()
 void setPressure(float targetValue)
 {
   int pumpValue;
-  float currentPressure = (getPressure() - 1.7f);
+  float currentPressure = (getPressure() - 2.2f);
 
   if (targetValue == 0 || currentPressure > targetValue)
   {
@@ -2306,9 +2312,8 @@ void brewDetect()
     // chatter) and reset boilerFullLatch before it could ever hold.
     if (wasBrewing)
     {
-      boilerFullLatch = false;      // Unlock idle control for next fill cycle
       targetWeightReached = false;  // Clear weight cut-off latch for next brew
-      setPumpBrightness(255);       // Dimmer back to 100% — GiCar has full pump control
+      resumeIdleBoilerFill();       // Unlock idle control and hand full pump control back to GiCar
     }
 
     if (cleaningRunActive)
@@ -2509,13 +2514,13 @@ void getMaschineInput()
   {
     if (!POWER_ON)
     {
+      resumeIdleBoilerFill();
       Serial.println("[DEBUG] POWER_ON = true (machine data received)");
     }
     POWER_ON = true;
   }
   else if (POWER_ON && lastFrameReceivedMs > 0 && (millis() - lastFrameReceivedMs > 15000))
   {
-    // No frame for 15 seconds — machine is off
     Serial.println("[DEBUG] POWER_ON = false (no serial for 15 seconds)");
     POWER_ON = false;
     brewTemp = 0;
