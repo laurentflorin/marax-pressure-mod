@@ -428,6 +428,13 @@ void resumeIdleBoilerFill()
   setPumpBrightness(255);
 }
 
+void primePressureFilter()
+{
+  sensorVal = (float)analogRead(PRESSURE_SENSOR_PIN);
+  filteredVal = sensorVal;
+  voltage = (filteredVal / 4096.0f) * 3.3f;
+}
+
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu OTA (Over-The-Air Updates)
 // nunununununununununununununununununununununununununununununun
@@ -531,6 +538,7 @@ void setup()
 
   // ESP32-S3 ADC is 12-bit (0–4095). Must set this before any analogRead().
   analogReadResolution(12);
+  primePressureFilter();
 
   // AC Dimming: Zero-cross interrupt and TRIAC control
   pinMode(PUMP_PIN, OUTPUT);
@@ -2088,6 +2096,15 @@ void updateIdlePumpControl()
 {
   if (brewActive) return;  // During brew, pressureProfile() owns the dimmer
 
+  // Do not latch boiler-full before the MaraX reports that it is actually on.
+  // During boot, steamTemp is still 0 and the pressure filter may not yet
+  // reflect the real sensor value.
+  if (!POWER_ON)
+  {
+    if (pumpBrightness != 255) setPumpBrightness(255);
+    return;
+  }
+
   // During cleaning/backflush the GiCar drives the pump on each lever press.
   // Keep the dimmer fully open so backflush pressure can build — the idle
   // "boiler full" cut-off below must not fight it.
@@ -2514,6 +2531,7 @@ void getMaschineInput()
   {
     if (!POWER_ON)
     {
+      primePressureFilter();
       resumeIdleBoilerFill();
       Serial.println("[DEBUG] POWER_ON = true (machine data received)");
     }
