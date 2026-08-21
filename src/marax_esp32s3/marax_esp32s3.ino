@@ -76,16 +76,15 @@
 //   GPIO12  → SD card SCK
 //   GPIO13  ← SD card MISO
 //
-// Machine Data Format: CSV
-//   Example frame: +1.10,023,,0,022,0000,0,0
+// Machine Data Format: CSV (field order as parsed by getMaschineInput())
+//   Example frame: +1.10,103,128,077,0000,1,0
 //   Field 0: Version/Mode (+1.10)
-//   Field 1: Brew temperature (023 = 23°C)
-//   Field 2: (empty)
-//   Field 3: Mode indicator
-//   Field 4: Steam temperature (022 = 22°C)
-//   Field 5: Fast heat countdown (0000)
-//   Field 6: Heating element status (0 = off, 1 = on)
-//   Field 7: Unknown
+//   Field 1: Steam temperature (103 = 103°C)
+//   Field 2: Steam target temperature (128 = 128°C, may be empty)
+//   Field 3: Brew temperature (077 = 77°C)
+//   Field 4: Fast heat countdown (0000)
+//   Field 5: Heating element status (0 = off, 1 = on)
+//   Field 6: Unknown
 // ═══════════════════════════════════════════════════════════════════════════
 
 #define MARAX_RX_PIN         16
@@ -187,9 +186,9 @@ PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
 // nunununununununununununu CONSTS
 // nunununununununununununununununununununununununununununununun
 #define REFRESH_SCREEN_EVERY 150 // Screen refresh interval (ms)
-#define PUMP_RANGE 255;
-
-const int REFRESH_TIME = 100;
+// Nextion writes during a brew are throttled to this interval so UART2 traffic
+// cannot pace the loop that runs pressure control and the weight cut-off.
+#define LIVE_DATA_REFRESH_MS 100
 
 bool brewActive = false;
 bool brewTimerActive = false; // active if brewing or descaling
@@ -217,19 +216,10 @@ bool heatingElementOn = false;
 int brewSwitchRelayPin = BREW_RELAY_PIN;
 int brewSwitchPin = BREW_SWITCH_PIN;
 
-float i = 0;
-float V, P, B;
-uint32_t number = 0;
-int inPin = 2;
-int pinOutput = 0;
-
 int shotCount = 0;
 
 float voltage;
-float bar;
 uint32_t barGraphValue;
-int analog = 0;
-float pressure;
 
 bool pressureProfilingEnabled = false;
 bool remoteProfilingEnabled = false;
@@ -239,14 +229,13 @@ bool cleaningRunActive = 0;
 int cleaningShots = 0;
 int cleaningShotsWater = 0;
 
-int brewSwitchAnalogValue = 0;
 bool brewSwitchStableOn = false;
 bool brewSwitchLastRawOn = false;
 bool brewSwitchDebounceInitialized = false;
 unsigned long brewSwitchLastChangeMs = 0;
 
-uint32_t currentPageId;
-int lastPageId;
+uint32_t currentPageId = 0;
+uint32_t lastPageId = 0;
 bool displayIsInSleep = true;
 
 // nunununununununununununununununununununununununununununununun
@@ -266,6 +255,14 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define PROFILE_TOUCH_COMPONENT_ID_MAX 14
 // Fallback page ID for `profile1` (matches page order in MaraxDisplayFile.HMI).
 #define PROFILE_PAGE_ID_FALLBACK 4
+// EasyNextionLibrary's readNumber() returns this sentinel when the display does
+// not answer in time (see readNumber() in EasyNextionLibrary.cpp). It is NOT -1,
+// so a plain ">= 0" check accepts the failure value.
+#define NEXTION_READ_FAILED 777777UL
+// Bounds for manual-mode values read back from the display. Anything outside
+// these ranges is a garbled read.
+#define MANUAL_PRESSURE_MAX_BAR 12
+#define MANUAL_SEGMENT_MAX_SECONDS 600
 #define WEIGHT_STABLE_WINDOW_MS 2000  // how long weight must be stable before committing observation
 #define WEIGHT_STABLE_THRESHOLD 0.5f  // max increase (g) over stability window
 #define OBSERVATION_MAX_WAIT_MS 5000 // max time to wait for stability after brew stop
@@ -898,13 +895,16 @@ bool isProfileSelectionPage(uint32_t pageId)
 void syncTargetWeightFromDisplay()
 {
   static int lastPersistedTargetWeight = -1;
-  int manualTargetWeight = myNex.readNumber("targetWeight");
+  uint32_t rawTargetWeight = 0;
 
-  // Guard against invalid readNumber() responses and out-of-range values.
-  if (manualTargetWeight < 1 || manualTargetWeight > 150)
+  // Guard against failed readNumber() responses and out-of-range values.
+  if (!readNextionNumber("targetWeight", rawTargetWeight) ||
+      rawTargetWeight < 1 || rawTargetWeight > 150)
   {
     return;
   }
+
+  int manualTargetWeight = (int)rawTargetWeight;
 
   if (manualTargetWeight != (int)targetWeight)
   {
@@ -1253,11 +1253,6 @@ void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float
   f.close();
 }
 
-void updateProfileSelectUi()
-{
-  populateProfileList();
-}
-
 void updateProfileModeText()
 {
   static char lastProfileMode[PROFILE_NAME_MAX_LEN] = "";
@@ -1567,28 +1562,42 @@ void liveData()
 {
   if (brewActive)
   {
-    // Write Brew Temp
-    myNex.writeNum("brewTemp", brewTemp);
-    // Write BrewTimer
-    myNex.writeNum("brewTime", (int)((millis() - activeBrewingStart) / 1000));
-    // Write Live Pressure as normal number
-    float pressure = getPressure();
-    // brewBar is an XFloat with 3 decimal places: it displays value/1000.
-    myNex.writeNum("barvar.val", (int)(pressure * 100));
-    // Map the pressure to wave pixels in graph (0–10 bar → 0–180 px)
-    barGraphValue = map((int)(pressure * 100), 0, 1000, 0, 180);
-    myNex.writeNum("barwave.val", barGraphValue);
+    unsigned long nowMs = millis();
 
-    if (scaleConnected)
+    // Throttle the display writes. Unthrottled they ran on every loop
+    // iteration: at 115200 baud the UART2 TX buffer fills, Serial2.print()
+    // blocks, and the display ends up pacing the loop that runs pressure
+    // control and the weight cut-off.
+    static unsigned long lastLiveDataMs = 0;
+    if (nowMs - lastLiveDataMs >= LIVE_DATA_REFRESH_MS)
     {
-      myNex.writeNum("weightVar.val", (int)(currentWeight * 10));
-      myNex.writeNum("flowVar.val", (int)(flowRate * 100));
+      lastLiveDataMs = nowMs;
+
+      // Write Brew Temp
+      myNex.writeNum("brewTemp", brewTemp);
+      // Write BrewTimer
+      myNex.writeNum("brewTime", (int)((nowMs - activeBrewingStart) / 1000));
+      // Write Live Pressure as normal number
+      float pressure = getPressure();
+      // barvar is an XFloat with 2 decimal places: it displays value/100.
+      myNex.writeNum("barvar.val", (int)(pressure * 100));
+      // Map the pressure to wave pixels in graph (0–10 bar → 0–180 px).
+      // getPressure() can return up to 12 bar, so clamp before mapping to keep
+      // the trace inside the waveform.
+      int pressureCentibar = constrain((int)(pressure * 100), 0, 1000);
+      barGraphValue = map(pressureCentibar, 0, 1000, 0, 180);
+      myNex.writeNum("barwave.val", barGraphValue);
+
+      if (scaleConnected)
+      {
+        myNex.writeNum("weightVar.val", (int)(currentWeight * 10));
+        myNex.writeNum("flowVar.val", (int)(flowRate * 100));
+      }
     }
 
     // Periodic dimmer diagnostics (every 1 second during brew)
     // lastDimmerDebugMs and lastZeroCrossCountDebug are globals seeded in
     // brewDetect() at brew start, so the very first reading is always accurate.
-    unsigned long nowMs = millis();
     if (nowMs - lastDimmerDebugMs >= 1000)
     {
       uint32_t snapshot = zeroCrossCount;  // single read, ISR-safe for uint32
@@ -1648,6 +1657,48 @@ float getPressure()
   return Pressure;
 }
 
+// Reads a numeric component from the display. Returns false and leaves `value`
+// untouched when the display did not answer, so no caller ever acts on the
+// NEXTION_READ_FAILED sentinel.
+bool readNextionNumber(const char *component, uint32_t &value)
+{
+  uint32_t raw = myNex.readNumber(component);
+  if (raw == NEXTION_READ_FAILED)
+  {
+    return false;
+  }
+  value = raw;
+  return true;
+}
+
+// Reads one manual-mode profile pressure from the display. Values outside the
+// sensor range are treated as garbled and leave the current value alone.
+void readManualProfilePressure(const char *component, int &pressureBar, int &waveValue)
+{
+  uint32_t value = 0;
+  if (!readNextionNumber(component, value) || value > MANUAL_PRESSURE_MAX_BAR)
+  {
+    return;
+  }
+  if ((int)value != pressureBar)
+  {
+    pressureBar = (int)value;
+    waveValue = map((int)value, 0, 10, 0, 180);
+  }
+}
+
+// Reads one manual-mode segment duration from the display, with the same
+// guard against failed reads.
+void readManualProfileTime(const char *component, int &segmentSeconds)
+{
+  uint32_t value = 0;
+  if (!readNextionNumber(component, value) || value > MANUAL_SEGMENT_MAX_SECONDS)
+  {
+    return;
+  }
+  segmentSeconds = (int)value;
+}
+
 void readSettigs()
 {
   if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive && !pendingObservation)
@@ -1671,11 +1722,18 @@ void readSettigs()
     static int lastPPEnabled = -1;
     static int lastRemoteEnabled = -1;
     
-    // readNumber() returns -1 on timeout/error. Guard: only accept 0 or 1.
-    int rawPP = myNex.readNumber("pPEnabled");
-    if (rawPP >= 0) pressureProfilingEnabled = (rawPP != 0);
-    int rawRemote = myNex.readNumber("remoteEnabled");
-    if (rawRemote >= 0) remoteProfilingEnabled = (rawRemote != 0);
+    // A failed read must not silently switch profiling on: readNextionNumber()
+    // rejects the sentinel, and only 0/1 are accepted as real answers.
+    uint32_t rawPP = 0;
+    if (readNextionNumber("pPEnabled", rawPP) && rawPP <= 1)
+    {
+      pressureProfilingEnabled = (rawPP != 0);
+    }
+    uint32_t rawRemote = 0;
+    if (readNextionNumber("remoteEnabled", rawRemote) && rawRemote <= 1)
+    {
+      remoteProfilingEnabled = (rawRemote != 0);
+    }
     
     // Only log if settings actually changed
     if (pressureProfilingEnabled != lastPPEnabled || 
@@ -1688,38 +1746,21 @@ void readSettigs()
       lastRemoteEnabled = remoteProfilingEnabled;
     }
     
-    // Manual mode (pressure profiling ON, remote OFF): read manual pressure settings
+    // Manual mode (pressure profiling ON, remote OFF): read manual pressure settings.
+    // Every value is checked for the failure sentinel and range-checked before
+    // it is applied — a single dropped display response must not corrupt the
+    // profile that pressureProfile() is running.
     if (!remoteProfilingEnabled && pressureProfilingEnabled)
     {
-      int temp = myNex.readNumber("t1p");
-      if (temp != t1p)
-      {
-        t1p = temp;
-        t1pWave = map(temp, 0, 10, 0, 180);
-      }
-      temp = myNex.readNumber("t2p");
-      if (temp != t2p)
-      {
-        t2p = temp;
-        t2pWave = map(temp, 0, 10, 0, 180);
-      }
-      temp = myNex.readNumber("t3p");
-      if (temp != t3p)
-      {
-        t3p = temp;
-        t3pWave = map(temp, 0, 10, 0, 180);
-      }
-      temp = myNex.readNumber("t4p");
-      if (temp != t4p)
-      {
-        t4p = temp;
-        t4pWave = map(temp, 0, 10, 0, 180);
-      }
+      readManualProfilePressure("t1p", t1p, t1pWave);
+      readManualProfilePressure("t2p", t2p, t2pWave);
+      readManualProfilePressure("t3p", t3p, t3pWave);
+      readManualProfilePressure("t4p", t4p, t4pWave);
 
-      t1t = myNex.readNumber("t1t");
-      t2t = myNex.readNumber("t2t");
-      t3t = myNex.readNumber("t3t");
-      t4t = myNex.readNumber("t4t");
+      readManualProfileTime("t1t", t1t);
+      readManualProfileTime("t2t", t2t);
+      readManualProfileTime("t3t", t3t);
+      readManualProfileTime("t4t", t4t);
     }
     
     // targetWeight is authoritative from display input when available.
@@ -1732,7 +1773,8 @@ void readSettigs()
 
 void updateDisplay()
 {
-  if ((millis() > pageRefreshTimer) && !brewActive)
+  // Wrap-safe interval check: pageRefreshTimer holds the last refresh time.
+  if ((millis() - pageRefreshTimer >= REFRESH_SCREEN_EVERY) && !brewActive)
   {
     if (POWER_ON && displayIsInSleep)
     {
@@ -1766,7 +1808,9 @@ void updateDisplay()
     
     updateScaleConnectionUi();
 
-    currentPageId = myNex.readNumber("dp");
+    // Keep the previous page id when the display does not answer, rather than
+    // letting the failure sentinel masquerade as a page change.
+    readNextionNumber("dp", currentPageId);
 
     if (isProfileSelectionPage(currentPageId))
     {
@@ -1814,7 +1858,7 @@ void updateDisplay()
       cleaningModeActive = false;
     }
 
-    pageRefreshTimer = millis() + REFRESH_SCREEN_EVERY;
+    pageRefreshTimer = millis();
   }
 }
 
@@ -1881,15 +1925,6 @@ void pressureProfile()
 {
   if (brewActive && pressureProfilingEnabled)
   {
-    // Safety: if all profile segments have zero duration, the profile is not
-    // configured. Skip profiling so the pump is not silently killed.
-    int totalProfileTime = t1t + t2t + t3t + t4t;
-    if (totalProfileTime == 0)
-    {
-      setPumpBrightness(255);  // No profile configured → full power
-      return;
-    }
-
     // Brew-by-weight auto-stop is only valid when a scale is connected and
     // we have received at least one weight sample in this session.
     bool brewByWeightActive =
@@ -1926,6 +1961,17 @@ void pressureProfile()
       }
     }
 
+    // Safety: if all profile segments have zero duration, the profile is not
+    // configured. Skip profiling so the pump is not silently killed. This is
+    // checked after the weight cut-off above so brew-by-weight still stops the
+    // shot when no profile is loaded.
+    int totalProfileTime = t1t + t2t + t3t + t4t;
+    if (totalProfileTime <= 0)
+    {
+      setPumpBrightness(255);  // No profile configured → full power
+      return;
+    }
+
     int brewSecs = (int)((millis() - activeBrewingStart) / 1000);
 
     if (brewSecs <= t1t)
@@ -1959,44 +2005,49 @@ void pressureProfile()
       myNex.writeNum("n0.pco", 1535);
       myNex.writeNum("n1.pco", 1535);
 
-      if (brewByWeightActive)
-      {
-        // Existing behavior: with a connected scale, profile completion can
-        // still terminate pump flow automatically.
-        myNex.writeNum("setbar.val", 0);
-        setPumpBrightness(0);
-      }
-      else
-      {
-        // No scale: continue at the final profile pressure and let the user
-        // end the shot manually with the lever.
-        int holdPressure = t4p;
-        int holdWave = t4pWave;
+      // The profile ran out of segments. Hold the last configured pressure and
+      // let the weight cut-off above — or the lever — end the shot. Cutting the
+      // pump here would end a brew-by-weight shot short of its target whenever
+      // the profile is shorter than the shot takes.
+      int holdPressure = t4p;
+      int holdWave = t4pWave;
 
-        if (t4t <= 0)
+      if (t4t <= 0)
+      {
+        if (t3t > 0)
         {
-          if (t3t > 0)
-          {
-            holdPressure = t3p;
-            holdWave = t3pWave;
-          }
-          else if (t2t > 0)
-          {
-            holdPressure = t2p;
-            holdWave = t2pWave;
-          }
-          else
-          {
-            holdPressure = t1p;
-            holdWave = t1pWave;
-          }
+          holdPressure = t3p;
+          holdWave = t3pWave;
         }
-
-        myNex.writeNum("setbar.val", holdWave);
-        setPressure(holdPressure);
+        else if (t2t > 0)
+        {
+          holdPressure = t2p;
+          holdWave = t2pWave;
+        }
+        else
+        {
+          holdPressure = t1p;
+          holdWave = t1pWave;
+        }
       }
+
+      myNex.writeNum("setbar.val", holdWave);
+      setPressure(holdPressure);
     }
   }
+}
+
+// Writes the brew button picture only when it actually changes. Sending it on
+// every idle loop iteration flooded UART2 for no benefit.
+void writeBrewButtonPicture(int picture)
+{
+  static int lastBrewButtonPicture = -1;
+  if (picture == lastBrewButtonPicture)
+  {
+    return;
+  }
+  lastBrewButtonPicture = picture;
+  myNex.writeNum("pBrew.pic", picture);
 }
 
 void brewDetect()
@@ -2033,7 +2084,7 @@ void brewDetect()
       myNex.writeStr("page brew");
       delay(10);
       brewTimer(true);
-      myNex.writeNum("pBrew.pic", 25);
+      writeBrewButtonPicture(25);
       brewActive = true;
       targetWeightReached = false;  // Fresh brew — clear the weight cut-off latch
 
@@ -2051,7 +2102,7 @@ void brewDetect()
     bool wasBrewing = brewActive;
     brewActive = false;
     brewTimer(false);
-    myNex.writeNum("pBrew.pic", 8);
+    writeBrewButtonPicture(8);
 
     // Only hand the dimmer back to idle control on the brew→idle edge.
     // Doing this every idle loop fought updateIdlePumpControl() (255↔0
@@ -2131,26 +2182,20 @@ void writeBrewRelay(bool brewOn)
 // Terminated with CR (\r)
 void getMaschineInput()
 {
-  static bool frameReceived = false;
-  static unsigned long lastMachineDebugMs = 0;
   static unsigned long lastFrameReceivedMs = 0;
-  bool anyBytesReceived = false;
   bool newFrameThisIteration = false;
   
   while (Serial1.available())
   {
-    anyBytesReceived = true;
     rc = Serial1.read();
 
     // Uncomment for raw byte debugging (disabled by default - confirmed working)
-    // if (!frameReceived) {
-    //   Serial.print("[RAW] 0x");
-    //   if ((uint8_t)rc < 0x10) Serial.print("0");
-    //   Serial.print((uint8_t)rc, HEX);
-    //   Serial.print(" (");
-    //   if (rc >= 0x20 && rc < 0x7F) Serial.print(rc); else Serial.print('?');
-    //   Serial.println(")");
-    // }
+    // Serial.print("[RAW] 0x");
+    // if ((uint8_t)rc < 0x10) Serial.print("0");
+    // Serial.print((uint8_t)rc, HEX);
+    // Serial.print(" (");
+    // if (rc >= 0x20 && rc < 0x7F) Serial.print(rc); else Serial.print('?');
+    // Serial.println(")");
     
     if (rc != endMarker)
     {
@@ -2165,7 +2210,6 @@ void getMaschineInput()
     {
       receivedCharsFromMarax[ndx] = '\0';
       ndx = 0;
-      frameReceived = true;
       newFrameThisIteration = true;
       lastFrameReceivedMs = millis();
       
@@ -2174,12 +2218,12 @@ void getMaschineInput()
       static int lastSteamTemp = -1;
       bool tempChanged = false;
 
-      // Parse CSV format: +1.10,034,138,022,0000,1,0
+      // Parse CSV format: +1.10,103,128,077,0000,1,0
       // Manual split to handle empty fields correctly (strtok skips them)
       // Field 0: Version (+1.10)
-      // Field 1: Brew temp (034 = 34°C)
-      // Field 2: Steam target temp (138°C, or empty)
-      // Field 3: Steam temp (022 = 22°C)
+      // Field 1: Steam temp (103 = 103°C)
+      // Field 2: Steam target temp (128°C, or empty)
+      // Field 3: Brew temp (077 = 77°C)
       // Field 4: Fast heat countdown (0000)
       // Field 5: Heating element (1 = on)
       // Field 6: Unknown
@@ -2207,8 +2251,8 @@ void getMaschineInput()
       }
       
       // Parse fields
-      // Frame: +1.10,103,128,077,0000,1,0
-      // field[3]=brew temp  field[2]=steam target  field[1]=steam temp  field[4]=countdown  field[5]=heating
+      // field[1]=steam temp  field[2]=steam target  field[3]=brew temp
+      // field[4]=countdown   field[5]=heating
       if (fieldCount > 3 && fields[3][0] != '\0')
       {
         int newBrewTemp = atoi(fields[3]);
@@ -2223,7 +2267,7 @@ void getMaschineInput()
       {
         steamTargetTemp = atoi(fields[2]);
       }
-      if (fieldCount > 3 && fields[1][0] != '\0')
+      if (fieldCount > 1 && fields[1][0] != '\0')
       {
         int newSteamTemp = atoi(fields[1]);
         if (newSteamTemp != lastSteamTemp)
