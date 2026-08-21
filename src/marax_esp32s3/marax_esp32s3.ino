@@ -158,8 +158,6 @@ void persistTargetWeight();
 void updateTargetWeightUi(bool force);
 void updateProfileSelectionHighlight();
 bool loadProfile(const char *filename);
-void loadBeta();
-void loadObservations();
 void updateProfileModeText();
 void scanProfiles();
 bool readRawBrewSwitchOn();
@@ -271,10 +269,6 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define WEIGHT_STABLE_WINDOW_MS 2000  // how long weight must be stable before committing observation
 #define WEIGHT_STABLE_THRESHOLD 0.5f  // max increase (g) over stability window
 #define OBSERVATION_MAX_WAIT_MS 5000 // max time to wait for stability after brew stop
-#define MIN_VALID_FINAL_WEIGHT 5.0f
-#define MAX_VALID_EXTRA_WEIGHT 15.0f
-#define OLS_SINGULARITY_THRESHOLD 1e-10
-#define OLS_MIN_OBSERVATIONS 5
 char activeProfileName[PROFILE_NAME_MAX_LEN] = "default";
 char activeProfileFileStem[PROFILE_NAME_MAX_LEN] = "default";
 char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
@@ -299,16 +293,6 @@ float flowRate = 0.0f;
 int lastScaleConnectedUi = -1; // -1 forces first UI update
 unsigned long lastScaleReconnectAttemptMs = 0;
 const unsigned long SCALE_RECONNECT_INTERVAL_MS = 30000;  // 30 seconds between scan attempts
-
-#define OLS_WINDOW 30
-#define GLOBAL_BETA_PATH "/models/global_beta.csv"
-#define GLOBAL_DATA_PATH "/models/global_data.csv"
-const float DEFAULT_OLS_BETA[5] = {0.0f, 0.6f, 0.0f, 0.0f, 0.0f};
-float olsBeta[5] = {DEFAULT_OLS_BETA[0], DEFAULT_OLS_BETA[1], DEFAULT_OLS_BETA[2], DEFAULT_OLS_BETA[3], DEFAULT_OLS_BETA[4]};
-float olsX[OLS_WINDOW][2];
-float olsY[OLS_WINDOW];
-int olsCount = 0;
-int olsWriteIndex = 0;
 
 bool pendingObservation = false;
 unsigned long pendingObsTime = 0;
@@ -358,8 +342,8 @@ unsigned long lastDimmerDebugMs = 0;
 uint32_t lastZeroCrossCountDebug = 0;
 // Latch: once pressure cuts the pump in idle, stay off until next brew ends
 bool boilerFullLatch = false;
-// Latch: once the predicted weight reaches target during a profiled brew,
-// keep the pump off until the brew ends (lever released)
+// Latch: once the weight reaches target minus the pressure-dependent offset
+// during a profiled brew, keep the pump off until the brew ends (lever released)
 bool targetWeightReached = false;
 volatile uint8_t  pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
 volatile uint32_t zeroCrossCount = 0;    // Incremented in ISR, read in debug
@@ -685,8 +669,6 @@ void setup()
 
     if (!SD.exists("/profiles"))
       SD.mkdir("/profiles");
-    if (!SD.exists("/models"))
-      SD.mkdir("/models");
     if (!SD.exists("/logs"))
       SD.mkdir("/logs");
 
@@ -702,8 +684,6 @@ void setup()
 
     scanProfiles();
     lastProfileScanMs = millis();
-    loadBeta();
-    loadObservations();
 
     if (profileCount > 0)
     {
@@ -1113,88 +1093,17 @@ void trigger50()
   //showProfileSelection();
 }
 
-float predictedFinalWeight(float flow, float pressure)
+// Weight the pump is cut early by, so the drip-through after the pump stops
+// lands the cup on target. Higher pressure at cut-off means more liquid still
+// in the puck/group, hence a bigger offset. Bands are hard coded (bar → g).
+float weightStopOffset(float pressure)
 {
-  return currentWeight + olsBeta[0] + olsBeta[1] * flow + olsBeta[2] * pressure + olsBeta[3] * flow * pressure + olsBeta[4] * flow * flow;
-}
-
-void fitOLS()
-{
-  if (olsCount < OLS_MIN_OBSERVATIONS)
-  {
-    return;
-  }
-
-  double XtX[5][5] = {};
-  double Xty[5] = {};
-
-  for (int i = 0; i < olsCount; i++)
-  {
-    double flow = (double)olsX[i][0];
-    double pressure = (double)olsX[i][1];
-    double row[5] = {1.0, flow, pressure, flow * pressure, flow * flow};
-    for (int r = 0; r < 5; r++)
-    {
-      Xty[r] += row[r] * olsY[i];
-      for (int c = 0; c < 5; c++)
-      {
-        XtX[r][c] += row[r] * row[c];
-      }
-    }
-  }
-
-  double A[5][6];
-  for (int r = 0; r < 5; r++)
-  {
-    for (int c = 0; c < 5; c++)
-    {
-      A[r][c] = XtX[r][c];
-    }
-    A[r][5] = Xty[r];
-  }
-
-  for (int col = 0; col < 5; col++)
-  {
-    int pivot = col;
-    for (int row = col + 1; row < 5; row++)
-    {
-      if (fabs(A[row][col]) > fabs(A[pivot][col]))
-      {
-        pivot = row;
-      }
-    }
-
-    for (int c = 0; c <= 5; c++)
-    {
-      double tmp = A[col][c];
-      A[col][c] = A[pivot][c];
-      A[pivot][c] = tmp;
-    }
-
-    if (fabs(A[col][col]) < OLS_SINGULARITY_THRESHOLD)
-    {
-      return;
-    }
-
-    for (int row = 0; row < 5; row++)
-    {
-      if (row == col)
-      {
-        continue;
-      }
-
-      double factor = A[row][col] / A[col][col];
-      for (int c = col; c <= 5; c++)
-      {
-        A[row][c] -= factor * A[col][c];
-      }
-    }
-  }
-
-  for (int i = 0; i < 5; i++)
-  {
-    olsBeta[i] = (float)(A[i][5] / A[i][i]);
-  }
+  if (pressure < 3.5f) return 0.2f;
+  if (pressure < 4.5f) return 0.5f;
+  if (pressure < 5.5f) return 0.75f;
+  if (pressure < 6.5f) return 1.0f;
+  if (pressure < 7.5f) return 1.5f;
+  return 2.0f;
 }
 
 bool loadProfile(const char *filename)
@@ -1283,158 +1192,6 @@ bool loadProfile(const char *filename)
   return idx >= PROFILE_FIELD_COUNT;
 }
 
-void loadBeta()
-{
-  for (int i = 0; i < 5; i++)
-  {
-    olsBeta[i] = DEFAULT_OLS_BETA[i];
-  }
-
-  if (!sdReady)
-  {
-    return;
-  }
-
-  File f = SD.open(GLOBAL_BETA_PATH);
-  if (!f)
-  {
-    return;
-  }
-
-  for (int i = 0; i < 5; i++)
-  {
-    if (f.available())
-    {
-      olsBeta[i] = f.readStringUntil('\n').toFloat();
-    }
-  }
-  f.close();
-}
-
-void saveBeta()
-{
-  if (!sdReady)
-  {
-    return;
-  }
-
-  SD.remove(GLOBAL_BETA_PATH);
-  File f = SD.open(GLOBAL_BETA_PATH, FILE_WRITE);
-  if (!f)
-  {
-    return;
-  }
-
-  for (int i = 0; i < 5; i++)
-  {
-    f.println(olsBeta[i], 6);
-  }
-  f.close();
-}
-
-void loadObservations()
-{
-  olsCount = 0;
-  olsWriteIndex = 0;
-
-  if (!sdReady)
-  {
-    return;
-  }
-
-  File f = SD.open(GLOBAL_DATA_PATH);
-  if (!f)
-  {
-    return;
-  }
-
-  f.readStringUntil('\n');
-
-  // Single-pass ring buffer: reads CSV sequentially, maintaining only the last
-  // OLS_WINDOW rows in circular buffers (rbX0, rbX1, rbY). rbHead wraps around
-  // via modulo arithmetic; rbCount tracks total rows stored (capped at OLS_WINDOW).
-  float rbX0[OLS_WINDOW], rbX1[OLS_WINDOW], rbY[OLS_WINDOW];
-  int rbHead = 0;
-  int rbCount = 0;
-
-  while (f.available())
-  {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0)
-    {
-      continue;
-    }
-
-    char buf[PROFILE_CSV_BUFFER_LEN];
-    line.toCharArray(buf, sizeof(buf));
-    char *tok = strtok(buf, ",");
-    int col = 0;
-    float vals[3];
-    while (tok != NULL && col < 3)
-    {
-      vals[col] = atof(tok);
-      tok = strtok(NULL, ",");
-      col++;
-    }
-
-    if (col == 3)
-    {
-      rbX0[rbHead] = vals[0];
-      rbX1[rbHead] = vals[1];
-      rbY[rbHead] = vals[2];
-      rbHead = (rbHead + 1) % OLS_WINDOW;
-      if (rbCount < OLS_WINDOW)
-      {
-        rbCount++;
-      }
-    }
-  }
-
-  f.close();
-
-  // Copy ring buffer into OLS arrays in chronological order
-  // If buffer not yet full, oldest entry is at index 0; otherwise it is at rbHead.
-  int start = (rbCount < OLS_WINDOW) ? 0 : rbHead;
-  for (int i = 0; i < rbCount; i++)
-  {
-    int idx = (start + i) % OLS_WINDOW;
-    olsX[i][0] = rbX0[idx];
-    olsX[i][1] = rbX1[idx];
-    olsY[i] = rbY[idx];
-  }
-
-  olsCount = rbCount;
-  olsWriteIndex = olsCount % OLS_WINDOW;
-  fitOLS();
-}
-
-void saveObservation(float flow, float pres, float extra)
-{
-  if (!sdReady)
-  {
-    return;
-  }
-
-  bool exists = SD.exists(GLOBAL_DATA_PATH);
-  File f = SD.open(GLOBAL_DATA_PATH, FILE_WRITE);
-  if (!f)
-  {
-    return;
-  }
-
-  if (!exists)
-  {
-    f.println("flow_rate_at_stop,pressure_at_stop,extra_weight");
-  }
-  f.print(flow, 4);
-  f.print(",");
-  f.print(pres, 4);
-  f.print(",");
-  f.println(extra, 4);
-  f.close();
-}
-
 void startPendingObservation(float flowAtStop, float pressAtStop)
 {
   if (!scaleConnected || lastWeightTime == 0)
@@ -1454,41 +1211,14 @@ void startPendingObservation(float flowAtStop, float pressAtStop)
   pendingBrewTimeS = (int)((now - activeBrewingStart) / 1000);
 }
 
-void finalizePendingObservation(float finalWeight, bool allowModelUpdate)
+void finalizePendingObservation(float finalWeight)
 {
   pendingObservation = false;
 
   float extraWeight = finalWeight - pendingWeightAtStop;
 
-  bool validForModel = true;
-  if (extraWeight < 0.0f || extraWeight > MAX_VALID_EXTRA_WEIGHT)
-  {
-    validForModel = false;
-  }
-  if (finalWeight < MIN_VALID_FINAL_WEIGHT)
-  {
-    validForModel = false;
-  }
-
-  if (allowModelUpdate && validForModel)
-  {
-    int slot = olsWriteIndex;
-    olsX[slot][0] = pendingFlowAtStop;
-    olsX[slot][1] = pendingPressAtStop;
-    olsY[slot] = extraWeight;
-
-    if (olsCount < OLS_WINDOW)
-    {
-      olsCount++;
-    }
-    olsWriteIndex = (olsWriteIndex + 1) % OLS_WINDOW;
-
-    fitOLS();
-    saveBeta();
-    saveObservation(pendingFlowAtStop, pendingPressAtStop, extraWeight);
-  }
-
-  // Always save the brew log once an observation window was started.
+  // Log the shot so the hard-coded pressure/offset table can be checked
+  // against what actually landed in the cup.
   saveBrewLog(finalWeight, pendingBrewTimeS, pendingFlowAtStop, pendingPressAtStop, extraWeight);
 }
 
@@ -1811,8 +1541,8 @@ void checkPendingObservation()
   if (now - pendingObsTime >= OBSERVATION_MAX_WAIT_MS)
   {
     // Timeout reached with unstable weight: keep the brew record using the
-    // current reading as finalWeight and include it in OLS training.
-    finalizePendingObservation(currentWeight, true);
+    // current reading as finalWeight.
+    finalizePendingObservation(currentWeight);
     return;
   }
 
@@ -1828,8 +1558,8 @@ void checkPendingObservation()
     return;
   }
 
-  // Stable within the configured window: accept this as final and train model.
-  finalizePendingObservation(currentWeight, true);
+  // Stable within the configured window: accept this as the final weight.
+  finalizePendingObservation(currentWeight);
 }
 
 // Gets "live" Info during brew
@@ -2167,10 +1897,10 @@ void pressureProfile()
         targetWeight > 0.0f &&
         lastWeightTime > 0;
 
-    // Target-weight latch: once the predicted final weight reaches target,
-    // keep the pump off for the rest of this brew. Without this latch the
-    // flow/pressure collapse after the pump stops drops the prediction back
-    // under target, and the profile segments below would switch it on again.
+    // Target-weight latch: once the cut-off weight has been reached, keep the
+    // pump off for the rest of this brew. Without this latch the pressure drop
+    // after the pump stops would shrink the offset again, and the profile
+    // segments below would switch the pump back on.
     if (targetWeightReached)
     {
       setPumpBrightness(0);
@@ -2180,8 +1910,7 @@ void pressureProfile()
     if (brewByWeightActive)
     {
       float pressureNow = getPressure();
-      float predicted = predictedFinalWeight(flowRate, pressureNow);
-      if (predicted >= targetWeight)
+      if (currentWeight >= targetWeight - weightStopOffset(pressureNow))
       {
         // Start stability window from the exact moment target stop is triggered.
         if (!pendingObservation)
