@@ -268,6 +268,19 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define PROFILE_ROW_BCO           8518  // dark slate background
 #define PROFILE_ROW_PCO_SELECTED  2016  // green text
 #define PROFILE_ROW_BCO_SELECTED 17036  // lighter slate background
+// Brew page graph, as defined in display/MaraxDisplayFile.HMI: the waveform
+// `s0` has object id 1, is 350 x 180 px with dis=100, and has two channels —
+// channel 0 carries the measured pressure, channel 1 the target. One sample
+// per x pixel, value 0..180 spanning 0..10 bar.
+#define BREW_PAGE_ID 2
+#define BREW_WAVEFORM_ID 1
+#define BREW_WAVEFORM_TARGET_CHANNEL 1
+#define BREW_WAVEFORM_WIDTH 350
+#define BREW_WAVEFORM_HEIGHT 180
+// Handshake timeouts for `addt` (transparent data mode): the display answers
+// 0xFE when it is ready for the raw bytes and 0xFD once it has taken them all.
+#define NEXTION_ADDT_READY_TIMEOUT_MS 200
+#define NEXTION_ADDT_DONE_TIMEOUT_MS 500
 // Bounds for manual-mode values read back from the display. Anything outside
 // these ranges is a garbled read.
 #define MANUAL_PRESSURE_MAX_BAR 12
@@ -284,6 +297,10 @@ int selectedProfileIndex = 0;
 int profileListPageStart = 0;
 int profileSelectionPageId = PROFILE_PAGE_ID_FALLBACK;
 bool profilePageNeedsPopulate = true;
+// Set when the brew page's target-curve preview has to be (re)drawn: on
+// entering the page, and when the loaded profile changes while it is open.
+bool brewPreviewNeedsDraw = false;
+uint32_t lastPreviewSignature = 0;
 unsigned long lastProfileScanMs = 0;
 const unsigned long PROFILE_SCAN_INTERVAL_MS = 30000;
 float targetWeight = 36.0f;
@@ -923,6 +940,12 @@ void updateTargetWeightUi(bool force)
   lastWasProfilePage = onProfilePage;
 }
 
+bool isBrewPage(uint32_t pageId)
+{
+  return pageId == (uint32_t)BREW_PAGE_ID ||
+         pageId == (uint32_t)(0xFF000000 | BREW_PAGE_ID);
+}
+
 bool isProfileSelectionPage(uint32_t pageId)
 {
   return pageId == (uint32_t)profileSelectionPageId ||
@@ -1155,6 +1178,43 @@ bool nextionProcessRx(uint32_t *capture)
 void serviceNextionRx()
 {
   nextionProcessRx(NULL);
+}
+
+// Waits for a single status byte from the display — the 0xFE / 0xFD handshake
+// of `addt`. Touch events arriving in the meantime are queued as usual, so a
+// press during a preview redraw is not lost.
+bool nextionWaitForStatus(uint8_t expected, unsigned long timeoutMs)
+{
+  unsigned long startMs = millis();
+  while (millis() - startMs < timeoutMs)
+  {
+    while (Serial2.available() > 0)
+    {
+      if (Serial2.peek() == 0x65)
+      {
+        if (Serial2.available() < 7)
+        {
+          break;  // rest of the touch packet is still in flight
+        }
+
+        uint8_t packet[7];
+        Serial2.readBytes(packet, sizeof(packet));
+        if (packet[4] == 0xFF && packet[5] == 0xFF && packet[6] == 0xFF)
+        {
+          queueNextionTouchEvent(packet[1], packet[2], packet[3]);
+        }
+        continue;
+      }
+
+      if ((uint8_t)Serial2.read() == expected)
+      {
+        return true;
+      }
+    }
+    delay(1);
+  }
+
+  return false;
 }
 
 void handleNextionProfileTouchEvents()
@@ -1968,7 +2028,30 @@ void updateDisplay()
       {
         profilePageNeedsPopulate = true;
       }
+      if (isBrewPage(currentPageId))
+      {
+        brewPreviewNeedsDraw = true;
+      }
       lastPageId = currentPageId;
+    }
+
+    // The preview is only ever drawn while idle: once a shot is running the
+    // graph belongs to the live trace, and after it finishes the result stays
+    // on screen until the page is left and re-entered.
+    if (isBrewPage(currentPageId))
+    {
+      uint32_t signature = profileSegmentSignature();
+      if (signature != lastPreviewSignature)
+      {
+        lastPreviewSignature = signature;
+        brewPreviewNeedsDraw = true;
+      }
+
+      if (brewPreviewNeedsDraw)
+      {
+        drawTargetProfilePreview();
+        brewPreviewNeedsDraw = false;
+      }
     }
 
     if (profilePageNeedsPopulate &&
@@ -1988,8 +2071,8 @@ void updateDisplay()
       myNex.writeNum("heatingel.val", heatingElementOn);
     }
 
-    // Read settings (except during active brew)
-    if (currentPageId != 4278190082 && currentPageId != 2)
+    // Read settings (except while the brew page is open)
+    if (!isBrewPage(currentPageId))
     {
       readSettigs();
     }
@@ -2067,6 +2150,94 @@ void setPressure(float targetValue)
     pumpValue = 255 / (1.f + exp(2.f - diff / 0.9f));
   }
   setPumpBrightness(pumpValue);
+}
+
+// Target pressure (bar) `second` seconds into the shot. Mirrors the segment
+// walk in pressureProfile(), including holding the last configured pressure
+// once the profile has run out.
+int profileTargetPressureAt(int second)
+{
+  if (second <= t1t) return t1p;
+  if (second <= t1t + t2t) return t2p;
+  if (second <= t1t + t2t + t3t) return t3p;
+  if (second <= t1t + t2t + t3t + t4t) return t4p;
+
+  if (t4t > 0) return t4p;
+  if (t3t > 0) return t3p;
+  if (t2t > 0) return t2p;
+  return t1p;
+}
+
+// Cheap fingerprint of the four segments, used to notice that a different
+// profile was loaded — or a manual value edited — while the brew page is open.
+uint32_t profileSegmentSignature()
+{
+  const int values[8] = { t1p, t1t, t2p, t2t, t3p, t3t, t4p, t4t };
+  uint32_t signature = 0;
+  for (int i = 0; i < 8; i++)
+  {
+    signature = signature * 31u + (uint32_t)values[i];
+  }
+  return signature;
+}
+
+// Draws the whole target curve of the active profile into the brew page's
+// waveform, so the shape of the shot is visible before the lever is pulled.
+// The profile is spread across the full width of the graph, so the preview
+// always fills it regardless of how long the profile runs.
+//
+// Two details make this work:
+//   * The HMI's own timers (`waveTimer`, `tm0`) call `add` on the waveform
+//     whenever the brew page is loaded, which would scroll the preview off
+//     within seconds. They are stopped here and started again by brewDetect()
+//     when a shot begins, which is the only time the live trace is wanted.
+//   * The samples go out with `addt` (transparent data mode), one byte each.
+//     350 individual `add` commands would be ~4.9 kB of UART traffic and would
+//     block the loop — and therefore brew detection — for close to half a
+//     second.
+bool drawTargetProfilePreview()
+{
+  // Freeze the live plotters so the preview stays put.
+  sendNextionCommand("waveTimer.en=0");
+  sendNextionCommand("tm0.en=0");
+  sendNextionCommand("cle " + String(BREW_WAVEFORM_ID) + ",255");
+
+  int totalSeconds = t1t + t2t + t3t + t4t;
+  if (!pressureProfilingEnabled || totalSeconds <= 0)
+  {
+    // Nothing configured to show — an empty graph is the honest answer.
+    return true;
+  }
+
+  static uint8_t points[BREW_WAVEFORM_WIDTH];
+  for (int i = 0; i < BREW_WAVEFORM_WIDTH; i++)
+  {
+    int second = (int)(((long)i * totalSeconds) / (BREW_WAVEFORM_WIDTH - 1));
+    int wave = map(profileTargetPressureAt(second), 0, 10, 0, BREW_WAVEFORM_HEIGHT);
+    points[i] = (uint8_t)constrain(wave, 0, BREW_WAVEFORM_HEIGHT);
+  }
+
+  sendNextionCommand("addt " + String(BREW_WAVEFORM_ID) + "," +
+                     String(BREW_WAVEFORM_TARGET_CHANNEL) + "," +
+                     String(BREW_WAVEFORM_WIDTH));
+
+  if (!nextionWaitForStatus(0xFE, NEXTION_ADDT_READY_TIMEOUT_MS))
+  {
+    Serial.println("[DISPLAY] Profile preview: display never signalled ready for addt");
+    return false;
+  }
+
+  Serial2.write(points, BREW_WAVEFORM_WIDTH);
+
+  if (!nextionWaitForStatus(0xFD, NEXTION_ADDT_DONE_TIMEOUT_MS))
+  {
+    Serial.println("[DISPLAY] Profile preview: display did not confirm the addt transfer");
+    return false;
+  }
+
+  Serial.print("[DISPLAY] Profile preview drawn: "); Serial.print(activeProfileName);
+  Serial.print(" over "); Serial.print(totalSeconds); Serial.println("s");
+  return true;
 }
 
 void pressureProfile()
@@ -2231,6 +2402,14 @@ void brewDetect()
     {
       myNex.writeStr("page brew");
       delay(10);
+
+      // Wipe the target-curve preview and hand the waveform back to the HMI's
+      // own plotters, which drawTargetProfilePreview() had stopped.
+      sendNextionCommand("cle " + String(BREW_WAVEFORM_ID) + ",255");
+      sendNextionCommand("waveTimer.en=1");
+      sendNextionCommand("tm0.en=1");
+      brewPreviewNeedsDraw = false;
+
       brewTimer(true);
       writeBrewButtonPicture(25);
       brewActive = true;
