@@ -255,10 +255,19 @@ int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 #define PROFILE_TOUCH_COMPONENT_ID_MAX 14
 // Fallback page ID for `profile1` (matches page order in MaraxDisplayFile.HMI).
 #define PROFILE_PAGE_ID_FALLBACK 4
-// EasyNextionLibrary's readNumber() returns this sentinel when the display does
-// not answer in time (see readNumber() in EasyNextionLibrary.cpp). It is NOT -1,
-// so a plain ">= 0" check accepts the failure value.
-#define NEXTION_READ_FAILED 777777UL
+// How long readNextionNumber() waits for a `get` reply before giving up. The
+// display answers in well under a millisecond at 115200 baud, so this is
+// generous; it only elapses when the display is busy, unplugged, or asked for
+// something that does not exist. Keep it well below the display refresh
+// interval so a dead read cannot stall the loop.
+#define NEXTION_READ_TIMEOUT_MS 150
+// Depth of the touch-event queue drained by handleNextionProfileTouchEvents().
+#define NEXTION_TOUCH_QUEUE_LEN 8
+// Row colours on the profile selection page (RGB565).
+#define PROFILE_ROW_PCO          65535  // white text
+#define PROFILE_ROW_BCO           8518  // dark slate background
+#define PROFILE_ROW_PCO_SELECTED  2016  // green text
+#define PROFILE_ROW_BCO_SELECTED 17036  // lighter slate background
 // Bounds for manual-mode values read back from the display. Anything outside
 // these ranges is a garbled read.
 #define MANUAL_PRESSURE_MAX_BAR 12
@@ -281,6 +290,18 @@ float targetWeight = 36.0f;
 bool sdReady = false;
 char persistedProfileFile[PROFILE_NAME_MAX_LEN] = "";
 Preferences preferences;
+
+// Touch events arriving on UART2 are queued by nextionProcessRx() instead of
+// being acted on where they are parsed, so a `get` reply can never swallow one.
+struct NextionTouchEvent
+{
+  uint8_t pageId;
+  uint8_t componentId;
+  uint8_t eventType;
+};
+NextionTouchEvent nextionTouchQueue[NEXTION_TOUCH_QUEUE_LEN];
+uint8_t nextionTouchQueueHead = 0;
+uint8_t nextionTouchQueueCount = 0;
 
 FelicitaScale_NimBLE scale(false);  // true = enable debug to see BLE scan results
 float currentWeight = 0.0f;
@@ -579,8 +600,19 @@ void setup()
   // We initialize Serial2 directly instead of calling myNex.begin(),
   // because myNex.begin() would call Serial2.begin(baud) without pin
   // arguments and overwrite our custom pin assignment.
+  // The default 256-byte RX buffer overflows when the display sends a burst
+  // (touch events plus `get` replies) while the loop is busy with SD or BLE
+  // work, and a truncated packet desynchronises the parser.
+  Serial2.setRxBufferSize(1024);
   Serial2.begin(115200, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
   Serial.println("[DEBUG] Serial2 (Nextion) started at 115200");
+
+  // Nextion's default bkcmd=2 returns a 4-byte error packet for every command
+  // that fails — which includes every write to a component that is not on the
+  // page currently loaded, something updateDisplay() does on each refresh.
+  // That junk used to pile up in front of the 0x65 touch events. bkcmd=0
+  // silences it; data returns (0x70/0x71 for `get`) are not affected.
+  sendNextionCommand("bkcmd=0");
 
   // Force a known value onto the display right now to verify display wiring
   Serial.println("[DEBUG] Testing Nextion display - writing BOOT to t0.txt");
@@ -595,6 +627,11 @@ void setup()
   }
   
   delay(2000);
+
+  // Re-send bkcmd: the display shares the power rail with the ESP32, so the
+  // first attempt above may have been sent before it finished booting.
+  sendNextionCommand("bkcmd=0");
+
   Serial1.write(0x11);
   Serial.println("[DEBUG] Sent 0x11 wakeup to machine");
 
@@ -922,18 +959,28 @@ void syncTargetWeightFromDisplay()
   }
 }
 
+// Marks the selected row by swapping its colours.
+//
+// The previous implementation used `.style=border` / `.borderw` / `.borderc`.
+// None of those work here: `style` is not a writable attribute on any Nextion
+// (and `border` is not a number), and the border attributes exist only on the
+// Intelligent series, not on the Basic/Enhanced 3.5" panel this project uses.
+// Every one of those commands failed, and each failure used to come back as a
+// junk packet on UART2.
 void updateProfileSelectionHighlight()
 {
   for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
   {
     int profileIndex = profileListPageStart + row;
-    String component = "profile1.t" + String(row);
-    if (profileIndex >= 0 && profileIndex < profileCount)
+    if (profileIndex < 0 || profileIndex >= profileCount)
     {
-      sendNextionCommand(component + ".style=border");
-      sendNextionCommand(component + ".borderw=" + String((profileIndex == selectedProfileIndex) ? 3 : 2));
-      sendNextionCommand(component + ".borderc=" + String((profileIndex == selectedProfileIndex) ? 2016 : 65535));
+      continue;
     }
+
+    bool selected = (profileIndex == selectedProfileIndex);
+    String component = "profile1.t" + String(row);
+    sendNextionCommand(component + ".pco=" + String(selected ? PROFILE_ROW_PCO_SELECTED : PROFILE_ROW_PCO));
+    sendNextionCommand(component + ".bco=" + String(selected ? PROFILE_ROW_BCO_SELECTED : PROFILE_ROW_BCO));
   }
 }
 
@@ -952,10 +999,10 @@ void populateProfileList()
         stem.remove(stem.length() - 4);
       }
 
+      // Colours are set by updateProfileSelectionHighlight() below, which runs
+      // for every visible row — no need to write them twice.
       sendNextionCommand(component + ".txt=\"" + nextionEscapedText(stem.c_str()) + "\"");
       sendNextionCommand(component + ".vis=1");
-      sendNextionCommand(component + ".pco=65535");
-      sendNextionCommand(component + ".bco=8518");
     }
     else
     {
@@ -1015,39 +1062,114 @@ void showProfileSelection()
 
   profilePageNeedsPopulate = false;
 }
+// Appends a touch event to the queue. If the queue is full the oldest event is
+// dropped — the most recent touch is the one the user is waiting on.
+void queueNextionTouchEvent(uint8_t pageId, uint8_t componentId, uint8_t eventType)
+{
+  if (nextionTouchQueueCount >= NEXTION_TOUCH_QUEUE_LEN)
+  {
+    nextionTouchQueueHead = (nextionTouchQueueHead + 1) % NEXTION_TOUCH_QUEUE_LEN;
+    nextionTouchQueueCount--;
+  }
+
+  uint8_t tail = (nextionTouchQueueHead + nextionTouchQueueCount) % NEXTION_TOUCH_QUEUE_LEN;
+  nextionTouchQueue[tail].pageId = pageId;
+  nextionTouchQueue[tail].componentId = componentId;
+  nextionTouchQueue[tail].eventType = eventType;
+  nextionTouchQueueCount++;
+}
+
+// Plain scalar out-parameters rather than a NextionTouchEvent reference: the
+// Arduino builder auto-generates prototypes for every function in the sketch,
+// and keeping sketch-defined types out of those signatures avoids depending on
+// where in the file it decides to place them.
+bool popNextionTouchEvent(uint8_t &pageId, uint8_t &componentId, uint8_t &eventType)
+{
+  if (nextionTouchQueueCount == 0)
+  {
+    return false;
+  }
+
+  pageId = nextionTouchQueue[nextionTouchQueueHead].pageId;
+  componentId = nextionTouchQueue[nextionTouchQueueHead].componentId;
+  eventType = nextionTouchQueue[nextionTouchQueueHead].eventType;
+  nextionTouchQueueHead = (nextionTouchQueueHead + 1) % NEXTION_TOUCH_QUEUE_LEN;
+  nextionTouchQueueCount--;
+  return true;
+}
+
+// Single entry point for everything arriving on UART2.
+//   * 0x65 touch packets are queued for handleNextionProfileTouchEvents().
+//   * A 0x71 numeric reply is decoded into `capture`, when one is supplied.
+//   * Any other byte is dropped so the stream resynchronises. The old handler
+//     returned on the first unrecognised byte, which let a single stray byte
+//     block every queued touch behind it indefinitely.
+// Returns true once a numeric reply has been captured.
+bool nextionProcessRx(uint32_t *capture)
+{
+  while (Serial2.available() > 0)
+  {
+    int head = Serial2.peek();
+
+    if (head == 0x65)
+    {
+      if (Serial2.available() < 7)
+      {
+        return false;  // rest of the packet is still in flight
+      }
+
+      uint8_t packet[7];
+      Serial2.readBytes(packet, sizeof(packet));
+      if (packet[4] == 0xFF && packet[5] == 0xFF && packet[6] == 0xFF)
+      {
+        queueNextionTouchEvent(packet[1], packet[2], packet[3]);
+      }
+      continue;
+    }
+
+    if (head == 0x71 && capture != NULL)
+    {
+      if (Serial2.available() < 8)
+      {
+        return false;
+      }
+
+      uint8_t packet[8];
+      Serial2.readBytes(packet, sizeof(packet));
+      if (packet[5] == 0xFF && packet[6] == 0xFF && packet[7] == 0xFF)
+      {
+        // 4-byte little-endian value.
+        *capture = (uint32_t)packet[1] |
+                   ((uint32_t)packet[2] << 8) |
+                   ((uint32_t)packet[3] << 16) |
+                   ((uint32_t)packet[4] << 24);
+        return true;
+      }
+      continue;
+    }
+
+    Serial2.read();
+  }
+
+  return false;
+}
+
+void serviceNextionRx()
+{
+  nextionProcessRx(NULL);
+}
+
 void handleNextionProfileTouchEvents()
 {
   static uint8_t handledPressComponentId = 0xFF;
 
-  while (Serial2.available() >= 1)
+  serviceNextionRx();
+
+  uint8_t pageId = 0;
+  uint8_t componentId = 0;
+  uint8_t eventType = 0;
+  while (popNextionTouchEvent(pageId, componentId, eventType))
   {
-    if (Serial2.peek() != 0x65)
-    {
-      // Leave non-touch bytes for EasyNextionLibrary readNumber()/responses.
-      return;
-    }
-
-    if (Serial2.available() < 7)
-    {
-      return;
-    }
-
-    uint8_t packet[7];
-    size_t bytesRead = Serial2.readBytes(packet, sizeof(packet));
-    if (bytesRead != sizeof(packet))
-    {
-      return;
-    }
-
-    if (packet[4] != 0xFF || packet[5] != 0xFF || packet[6] != 0xFF)
-    {
-      continue;
-    }
-
-    uint8_t pageId = packet[1];
-    uint8_t componentId = packet[2];
-    uint8_t eventType = packet[3];
-
     bool isProfileRowTouch =
         componentId >= PROFILE_TOUCH_COMPONENT_ID_MIN &&
         componentId <= PROFILE_TOUCH_COMPONENT_ID_MAX;
@@ -1261,20 +1383,24 @@ void updateProfileModeText()
   if (pressureProfilingEnabled && remoteProfilingEnabled && sdReady)
   {
     newMode = activeProfileName;
-    myNex.writeStr("profileModetxt.txt", activeProfileName);  // local var on brew page (for Preinitialize)
-    myNex.writeStr("profileMode.txt", activeProfileName);    // direct write if currently on brew page
   }
   else if (pressureProfilingEnabled)
   {
     newMode = "Manual";
-    myNex.writeStr("profileModetxt.txt", "Manual");
-    myNex.writeStr("profileMode.txt", "Manual");
   }
   else
   {
     newMode = "None";
-    myNex.writeStr("profileModetxt.txt", "None");
-    myNex.writeStr("profileMode.txt", "None");
+  }
+
+  myNex.writeStr("profileModetxt.txt", newMode);  // global var read by the brew page on Preinitialize
+
+  // profileMode.txt only exists on the brew page, so writing it while the
+  // profile list is open can only fail. Skip it: this runs on every display
+  // refresh, and UART2 time on that page is better spent on touch events.
+  if (!isProfileSelectionPage(currentPageId))
+  {
+    myNex.writeStr("profileMode.txt", newMode);  // direct write if currently on brew page
   }
 
   // Only log if mode actually changed
@@ -1302,8 +1428,9 @@ void updateScaleConnectionUi()
 
     // Update global variable (used by home page timer to refresh scalecon.val)
     myNex.writeNum("scaleConnected", connected);
-    // Directly update p3.pic on home page (pic 20=connected, 21=disconnected)
-    // home.p3.pic works as a cross-page write; silently ignored if home page not loaded
+    // Directly update p3.pic on home page (pic 20=connected, 21=disconnected).
+    // The cross-page write fails when the home page is not loaded; with bkcmd=0
+    // (set in setup()) that failure is silent instead of returning a junk packet.
     myNex.writeNum("home.p3.pic", connected ? 20 : 21);
 
     lastScaleConnectedUi = connected;
@@ -1658,17 +1785,35 @@ float getPressure()
 }
 
 // Reads a numeric component from the display. Returns false and leaves `value`
-// untouched when the display did not answer, so no caller ever acts on the
-// NEXTION_READ_FAILED sentinel.
+// untouched when the display did not answer in time.
+//
+// This deliberately does not use EasyNextionLibrary's readNumber(): that one
+// begins by discarding every byte already in the RX buffer that is not part of
+// its own '#' custom protocol — touch events included — and then scans past
+// anything that is not 0x71, so a profile selection made while a read was in
+// flight was silently thrown away. Going through nextionProcessRx() keeps
+// touch events queued while we wait for the reply.
 bool readNextionNumber(const char *component, uint32_t &value)
 {
-  uint32_t raw = myNex.readNumber(component);
-  if (raw == NEXTION_READ_FAILED)
+  // Clear anything already pending (touches are kept) so a late reply to an
+  // earlier `get` cannot be mistaken for the answer to this one.
+  nextionProcessRx(NULL);
+
+  sendNextionCommand("get " + String(component));
+
+  uint32_t received = 0;
+  unsigned long startMs = millis();
+  while (millis() - startMs < NEXTION_READ_TIMEOUT_MS)
   {
-    return false;
+    if (nextionProcessRx(&received))
+    {
+      value = received;
+      return true;
+    }
+    delay(1);  // yield to FreeRTOS instead of spinning on the UART
   }
-  value = raw;
-  return true;
+
+  return false;
 }
 
 // Reads one manual-mode profile pressure from the display. Values outside the
@@ -1835,10 +1980,15 @@ void updateDisplay()
       profilePageNeedsPopulate = false;
     }
 
-    // Always write all values - page checks removed for simplicity
-    myNex.writeNum("tarsteam.val", steamTargetTemp);
-    myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
-    myNex.writeNum("heatingel.val", heatingElementOn);
+    // These are home-page components: writing them while the profile list is
+    // open can only fail, so skip the traffic on the page where touch latency
+    // matters. Every other page still gets them unconditionally.
+    if (!isProfileSelectionPage(currentPageId))
+    {
+      myNex.writeNum("tarsteam.val", steamTargetTemp);
+      myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
+      myNex.writeNum("heatingel.val", heatingElementOn);
+    }
 
     // Read settings (except during active brew)
     if (currentPageId != 4278190082 && currentPageId != 2)
