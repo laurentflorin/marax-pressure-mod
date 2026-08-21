@@ -1036,12 +1036,10 @@ bool selectProfile(int profileIndex)
 void handleProfileSelection(int rowIndex)
 {
   int profileIndex = profileListPageStart + rowIndex;
-  if (!selectProfile(profileIndex))
-  {
-    return;
-  }
-
-  sendNextionCommand("page home");
+  // Stay on the profile list after a selection — selectProfile() has already
+  // moved the highlight to the new row, which is the feedback the user needs.
+  // Leaving the page is the display's job, via the HMI's own back button.
+  selectProfile(profileIndex);
 }
 
 void showProfileSelection()
