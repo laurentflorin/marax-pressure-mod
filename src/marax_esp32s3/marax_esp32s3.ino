@@ -163,6 +163,12 @@ bool readRawBrewSwitchOn();
 bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
 void resumeIdleBoilerFill();
+void applyManualStepsToProfile();
+float profileTotalSeconds();
+float profileTargetPressureAt(float second);
+int pressureToWave(float bar);
+void writeBrewTimerColour(uint32_t colour);
+void writeSetBarValue(int wave);
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -264,8 +270,43 @@ bool displayIsInSleep = true;
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu Pressure Profile
 // nunununununununununununununununununununununununununununununun
+// A profile is a polyline. Each point anchors a target pressure at an absolute
+// time from the start of the shot, and `jump` says how the curve reaches that
+// point:
+//
+//   ramp — interpolate linearly from the previous point
+//   jump — hold the previous pressure until this point's time, then step to it
+//
+// Together they express everything from a classic four-step staircase (every
+// point a jump) to a smooth declining curve (every point a ramp), including
+// mixtures: hold 3 bar, jump straight to 8, hold, then ramp down to 6.
+#define MAX_PROFILE_POINTS 16
+#define PROFILE_MAX_BAR 12.0f
+#define PROFILE_MAX_SECONDS 600.0f
+// Two points is the minimum that describes a span of time; one point has no
+// duration and would leave the pump with nothing to follow.
+#define PROFILE_MIN_POINTS 2
+
+struct ProfilePoint
+{
+  float seconds;  // absolute time from the start of the shot
+  float bar;      // target pressure at that moment
+  bool jump;      // true: step at `seconds`, false: ramp in from the point before
+};
+
+ProfilePoint profilePoints[MAX_PROFILE_POINTS];
+int profilePointCount = 0;
+
+// Parsed from the profile file and preserved when it is written back, but
+// deliberately NOT applied to the running `targetWeight` — the brew-by-weight
+// target comes from the display and Preferences, and always has. Keeping the
+// field intact means hand-edited files do not lose it on a round trip.
+float profileTargetWeightField = 0.0f;
+
+// Manual mode only: the display's four fixed step fields. The Nextion firmware
+// has physical t1p…t4t inputs, so manual editing stays four steps; they are
+// converted into profilePoints[] by applyManualStepsToProfile().
 int t1p = 0, t1t = 0, t2p = 0, t2t = 0, t3p = 0, t3t = 0, t4p = 0, t4t = 0;
-int t1pWave = 0, t2pWave = 0, t3pWave = 0, t4pWave = 0;
 
 // SD / Profile globals
 #define MAX_PROFILES 64
@@ -1314,6 +1355,138 @@ float weightStopOffset(float pressure)
   return 2.0f;
 }
 
+// Copies a profile's display name, truncating rather than overflowing.
+static void setActiveProfileName(const char *name)
+{
+  strncpy(activeProfileName, name, sizeof(activeProfileName) - 1);
+  activeProfileName[sizeof(activeProfileName) - 1] = '\0';
+}
+
+// Recognises the fixed ten-column layout this mod shipped with:
+//   name,t1p,t1t,t2p,t2t,t3p,t3t,t4p,t4t,target_weight
+static bool isLegacyProfileHeader(const String &header)
+{
+  return header.startsWith("name,t1p");
+}
+
+// Converts a legacy row into the polyline. Each of the four segments held its
+// pressure for its own duration, so every point is a jump — the staircase is
+// preserved exactly, and the profile still ends after the same total time.
+static bool parseLegacyProfileRow(const String &row)
+{
+  char buf[PROFILE_CSV_BUFFER_LEN];
+  row.toCharArray(buf, sizeof(buf));
+
+  int steps[8] = { 0 };
+  int idx = 0;
+  char *token = strtok(buf, ",");
+  while (token != NULL && idx < PROFILE_FIELD_COUNT)
+  {
+    if (idx == 0)
+    {
+      setActiveProfileName(token);
+    }
+    else if (idx <= 8)
+    {
+      steps[idx - 1] = atoi(token);
+    }
+    else
+    {
+      // Parsed so a round trip through Home Assistant does not lose it, but
+      // never applied — see profileTargetWeightField.
+      profileTargetWeightField = atof(token);
+    }
+    idx++;
+    token = strtok(NULL, ",");
+  }
+
+  if (idx < PROFILE_FIELD_COUNT)
+  {
+    return false;
+  }
+
+  t1p = steps[0]; t1t = steps[1];
+  t2p = steps[2]; t2t = steps[3];
+  t3p = steps[4]; t3t = steps[5];
+  t4p = steps[6]; t4t = steps[7];
+  applyManualStepsToProfile();
+  return true;
+}
+
+// Parses one line of the v2 format. Every line is `key,values…`, so unknown
+// keys can be ignored and the format stays extensible:
+//
+//   # comment
+//   name,Classic Espresso
+//   target_weight,36.0
+//   point,<seconds>,<bar>[,ramp|jump]
+//
+// Returns false only on a line that would corrupt the profile; an unknown key
+// is not an error.
+static bool parseProfileV2Line(char *line)
+{
+  char *key = strtok(line, ",");
+  if (key == NULL)
+  {
+    return true;
+  }
+
+  if (strcmp(key, "name") == 0)
+  {
+    char *value = strtok(NULL, ",");
+    if (value != NULL)
+    {
+      setActiveProfileName(value);
+    }
+    return true;
+  }
+
+  if (strcmp(key, "target_weight") == 0)
+  {
+    char *value = strtok(NULL, ",");
+    if (value != NULL)
+    {
+      profileTargetWeightField = atof(value);
+    }
+    return true;
+  }
+
+  if (strcmp(key, "point") != 0)
+  {
+    return true;
+  }
+
+  char *secondsToken = strtok(NULL, ",");
+  char *barToken = strtok(NULL, ",");
+  char *modeToken = strtok(NULL, ",");
+  if (secondsToken == NULL || barToken == NULL)
+  {
+    return false;
+  }
+  if (profilePointCount >= MAX_PROFILE_POINTS)
+  {
+    Serial.println("[SD] loadProfile: too many points, truncating");
+    return false;
+  }
+
+  ProfilePoint &point = profilePoints[profilePointCount];
+  point.seconds = constrain((float)atof(secondsToken), 0.0f, PROFILE_MAX_SECONDS);
+  point.bar = constrain((float)atof(barToken), 0.0f, PROFILE_MAX_BAR);
+  // Ramping is the default; only an explicit `jump` steps.
+  point.jump = (modeToken != NULL && strcmp(modeToken, "jump") == 0);
+
+  // profileTargetPressureAt() walks the points in order, so an unsorted file
+  // would silently skip segments. Reject it instead.
+  if (profilePointCount > 0 && point.seconds < profilePoints[profilePointCount - 1].seconds)
+  {
+    Serial.println("[SD] loadProfile: points are not in ascending time order");
+    return false;
+  }
+
+  profilePointCount++;
+  return true;
+}
+
 bool loadProfile(const char *filename)
 {
   if (!sdReady)
@@ -1333,12 +1506,6 @@ bool loadProfile(const char *filename)
   }
   Serial.print("[SD] loadProfile: opened OK — size="); Serial.println(f.size());
 
-  String line;
-  f.readStringUntil('\n');
-  line = f.readStringUntil('\n');
-  f.close();
-  line.trim();
-
   strncpy(activeProfileFileStem, filename, sizeof(activeProfileFileStem) - 1);
   activeProfileFileStem[sizeof(activeProfileFileStem) - 1] = '\0';
   char *ext = strrchr(activeProfileFileStem, '.');
@@ -1346,58 +1513,80 @@ bool loadProfile(const char *filename)
   {
     *ext = '\0';
   }
+  setActiveProfileName(activeProfileFileStem);
 
-  strncpy(activeProfileName, activeProfileFileStem, sizeof(activeProfileName) - 1);
-  activeProfileName[sizeof(activeProfileName) - 1] = '\0';
+  // Parse into scratch state first: a half-read file must not leave the pump
+  // following a profile that is partly the old one and partly the new.
+  ProfilePoint previousPoints[MAX_PROFILE_POINTS];
+  int previousCount = profilePointCount;
+  memcpy(previousPoints, profilePoints, sizeof(previousPoints));
+  profilePointCount = 0;
+  profileTargetWeightField = 0.0f;
 
-  int idx = 0;
-  char buf[PROFILE_CSV_BUFFER_LEN];
-  line.toCharArray(buf, sizeof(buf));
-  char *token = strtok(buf, ",");
-  while (token != NULL)
+  String header = f.readStringUntil('\n');
+  // Some editors write a UTF-8 byte-order mark. It is invisible, the old reader
+  // skipped the header line without looking at it so it never mattered, and the
+  // shipped blooming_espresso.csv has one — but it would defeat the format
+  // sniffing below and make the file unreadable.
+  if (header.length() >= 3 &&
+      (uint8_t)header.charAt(0) == 0xEF &&
+      (uint8_t)header.charAt(1) == 0xBB &&
+      (uint8_t)header.charAt(2) == 0xBF)
   {
-    switch (idx)
+    header.remove(0, 3);
+  }
+  header.trim();
+
+  bool ok;
+  if (isLegacyProfileHeader(header))
+  {
+    String row = f.readStringUntil('\n');
+    row.trim();
+    ok = parseLegacyProfileRow(row);
+    Serial.println("[SD] loadProfile: legacy 4-step format");
+  }
+  else
+  {
+    // In v2 the first line carries data like any other, so it is parsed here
+    // rather than skipped as a header.
+    ok = true;
+    String line = header;
+    while (line.length() > 0)
     {
-    case 0:
-      strncpy(activeProfileName, token, sizeof(activeProfileName) - 1);
-      activeProfileName[sizeof(activeProfileName) - 1] = '\0';
-      break;
-    case 1:
-      t1p = atoi(token);
-      t1pWave = map(t1p, 0, 10, 0, 180);
-      break;
-    case 2:
-      t1t = atoi(token);
-      break;
-    case 3:
-      t2p = atoi(token);
-      t2pWave = map(t2p, 0, 10, 0, 180);
-      break;
-    case 4:
-      t2t = atoi(token);
-      break;
-    case 5:
-      t3p = atoi(token);
-      t3pWave = map(t3p, 0, 10, 0, 180);
-      break;
-    case 6:
-      t3t = atoi(token);
-      break;
-    case 7:
-      t4p = atoi(token);
-      t4pWave = map(t4p, 0, 10, 0, 180);
-      break;
-    case 8:
-      t4t = atoi(token);
-      break;
-    case 9:
-      break;
+      line.trim();
+      if (line.length() > 0 && line.charAt(0) != '#')
+      {
+        char buf[PROFILE_CSV_BUFFER_LEN];
+        line.toCharArray(buf, sizeof(buf));
+        if (!parseProfileV2Line(buf))
+        {
+          ok = false;
+          break;
+        }
+      }
+      line = f.readStringUntil('\n');
     }
-    idx++;
-    token = strtok(NULL, ",");
+
+    if (ok && profilePointCount < PROFILE_MIN_POINTS)
+    {
+      Serial.print("[SD] loadProfile: only "); Serial.print(profilePointCount);
+      Serial.println(" point(s) — not a usable profile");
+      ok = false;
+    }
+  }
+  f.close();
+
+  if (!ok)
+  {
+    memcpy(profilePoints, previousPoints, sizeof(profilePoints));
+    profilePointCount = previousCount;
+    return false;
   }
 
-  return idx >= PROFILE_FIELD_COUNT;
+  Serial.print("[SD] loadProfile: '"); Serial.print(activeProfileName);
+  Serial.print("' — "); Serial.print(profilePointCount);
+  Serial.print(" points over "); Serial.print(profileTotalSeconds(), 1); Serial.println("s");
+  return true;
 }
 
 void startPendingObservation(float flowAtStop, float pressAtStop)
@@ -2006,18 +2195,14 @@ bool readNextionNumber(const char *component, uint32_t &value)
 
 // Reads one manual-mode profile pressure from the display. Values outside the
 // sensor range are treated as garbled and leave the current value alone.
-void readManualProfilePressure(const char *component, int &pressureBar, int &waveValue)
+void readManualProfilePressure(const char *component, int &pressureBar)
 {
   uint32_t value = 0;
   if (!readNextionNumber(component, value) || value > MANUAL_PRESSURE_MAX_BAR)
   {
     return;
   }
-  if ((int)value != pressureBar)
-  {
-    pressureBar = (int)value;
-    waveValue = map((int)value, 0, 10, 0, 180);
-  }
+  pressureBar = (int)value;
 }
 
 // Reads one manual-mode segment duration from the display, with the same
@@ -2085,15 +2270,19 @@ void readSettigs()
     // profile that pressureProfile() is running.
     if (!remoteProfilingEnabled && pressureProfilingEnabled)
     {
-      readManualProfilePressure("t1p", t1p, t1pWave);
-      readManualProfilePressure("t2p", t2p, t2pWave);
-      readManualProfilePressure("t3p", t3p, t3pWave);
-      readManualProfilePressure("t4p", t4p, t4pWave);
+      readManualProfilePressure("t1p", t1p);
+      readManualProfilePressure("t2p", t2p);
+      readManualProfilePressure("t3p", t3p);
+      readManualProfilePressure("t4p", t4p);
 
       readManualProfileTime("t1t", t1t);
       readManualProfileTime("t2t", t2t);
       readManualProfileTime("t3t", t3t);
       readManualProfileTime("t4t", t4t);
+
+      // The pump follows profilePoints[] whatever the source, so the four
+      // display fields are folded into the same representation.
+      applyManualStepsToProfile();
     }
     
     // targetWeight is authoritative from display input when available.
@@ -2282,33 +2471,118 @@ void setPressure(float targetValue)
   setPumpBrightness(pumpValue);
 }
 
-// Target pressure (bar) `second` seconds into the shot. Mirrors the segment
-// walk in pressureProfile(), including holding the last configured pressure
-// once the profile has run out.
-int profileTargetPressureAt(int second)
+// How long the profile runs: the time of its last point. Zero means nothing is
+// configured, which the callers treat as "no profiling".
+float profileTotalSeconds()
 {
-  if (second <= t1t) return t1p;
-  if (second <= t1t + t2t) return t2p;
-  if (second <= t1t + t2t + t3t) return t3p;
-  if (second <= t1t + t2t + t3t + t4t) return t4p;
-
-  if (t4t > 0) return t4p;
-  if (t3t > 0) return t3p;
-  if (t2t > 0) return t2p;
-  return t1p;
+  if (profilePointCount <= 0)
+  {
+    return 0.0f;
+  }
+  return profilePoints[profilePointCount - 1].seconds;
 }
 
-// Cheap fingerprint of the four segments, used to notice that a different
-// profile was loaded — or a manual value edited — while the brew page is open.
+// Target pressure (bar) `second` seconds into the shot, interpolated along the
+// polyline. Before the first point and after the last one the nearest point's
+// pressure is held — running out of profile must not drop the pump to zero
+// mid-shot, or a brew-by-weight shot would stop short of its target.
+float profileTargetPressureAt(float second)
+{
+  if (profilePointCount <= 0)
+  {
+    return 0.0f;
+  }
+  if (second <= profilePoints[0].seconds)
+  {
+    return profilePoints[0].bar;
+  }
+
+  for (int i = 1; i < profilePointCount; i++)
+  {
+    const ProfilePoint &previous = profilePoints[i - 1];
+    const ProfilePoint &current = profilePoints[i];
+
+    if (second >= current.seconds)
+    {
+      continue;
+    }
+
+    if (current.jump)
+    {
+      // Not there yet, and this point is a step: the previous pressure stands.
+      return previous.bar;
+    }
+
+    float span = current.seconds - previous.seconds;
+    if (span <= 0.0f)
+    {
+      // Two points at the same instant — a vertical edge, so the later one wins.
+      return current.bar;
+    }
+    float progress = (second - previous.seconds) / span;
+    return previous.bar + progress * (current.bar - previous.bar);
+  }
+
+  return profilePoints[profilePointCount - 1].bar;
+}
+
+// Converts the display's four manual steps into the polyline the pump follows.
+// Each step holds its pressure for its own duration, so every point is a jump —
+// which is exactly the staircase manual mode has always produced.
+void applyManualStepsToProfile()
+{
+  const int pressures[4] = { t1p, t2p, t3p, t4p };
+  const int durations[4] = { t1t, t2t, t3t, t4t };
+
+  profilePointCount = 0;
+  profilePoints[profilePointCount++] = { 0.0f, (float)pressures[0], false };
+
+  float elapsed = 0.0f;
+  for (int i = 0; i < 4; i++)
+  {
+    elapsed += (float)durations[i];
+    // The pressure of the *next* step starts where this one ends; the last
+    // step holds its own pressure to the end of the profile.
+    float bar = (float)((i < 3) ? pressures[i + 1] : pressures[3]);
+    profilePoints[profilePointCount++] = { elapsed, bar, true };
+  }
+}
+
+// Cheap fingerprint of the polyline, used to notice that a different profile
+// was loaded — or a manual value edited — while the brew page is open. Times
+// and pressures are folded in at their 0.1 resolution.
 uint32_t profileSegmentSignature()
 {
-  const int values[8] = { t1p, t1t, t2p, t2t, t3p, t3t, t4p, t4t };
-  uint32_t signature = 0;
-  for (int i = 0; i < 8; i++)
+  uint32_t signature = (uint32_t)profilePointCount;
+  for (int i = 0; i < profilePointCount; i++)
   {
-    signature = signature * 31u + (uint32_t)values[i];
+    signature = signature * 31u + (uint32_t)(profilePoints[i].seconds * 10.0f);
+    signature = signature * 31u + (uint32_t)(profilePoints[i].bar * 10.0f);
+    signature = signature * 31u + (profilePoints[i].jump ? 1u : 0u);
   }
   return signature;
+}
+
+// Pressure (bar) to a waveform sample on the brew page's 0..10 bar scale.
+int pressureToWave(float bar)
+{
+  int wave = (int)((bar / 10.0f) * BREW_WAVEFORM_HEIGHT + 0.5f);
+  return constrain(wave, 0, BREW_WAVEFORM_HEIGHT);
+}
+
+// Writes the target-pressure bar only when the sample actually changes. With
+// ramped profiles the target moves continuously, and pressureProfile() runs on
+// every loop iteration — writing it unconditionally would flood UART2 during a
+// shot, which is the one time the loop must stay quick.
+void writeSetBarValue(int wave)
+{
+  static int lastWave = -1;
+  if (wave == lastWave)
+  {
+    return;
+  }
+  lastWave = wave;
+  myNex.writeNum("setbar.val", wave);
 }
 
 // Draws the whole target curve of the active profile into the brew page's
@@ -2332,8 +2606,8 @@ bool drawTargetProfilePreview()
   sendNextionCommand("tm0.en=0");
   sendNextionCommand("cle " + String(BREW_WAVEFORM_ID) + ",255");
 
-  int totalSeconds = t1t + t2t + t3t + t4t;
-  if (!pressureProfilingEnabled || totalSeconds <= 0)
+  float totalSeconds = profileTotalSeconds();
+  if (!pressureProfilingEnabled || totalSeconds <= 0.0f)
   {
     // Nothing configured to show — an empty graph is the honest answer.
     return true;
@@ -2342,9 +2616,8 @@ bool drawTargetProfilePreview()
   static uint8_t points[BREW_WAVEFORM_WIDTH];
   for (int i = 0; i < BREW_WAVEFORM_WIDTH; i++)
   {
-    int second = (int)(((long)i * totalSeconds) / (BREW_WAVEFORM_WIDTH - 1));
-    int wave = map(profileTargetPressureAt(second), 0, 10, 0, BREW_WAVEFORM_HEIGHT);
-    points[i] = (uint8_t)constrain(wave, 0, BREW_WAVEFORM_HEIGHT);
+    float second = ((float)i * totalSeconds) / (float)(BREW_WAVEFORM_WIDTH - 1);
+    points[i] = (uint8_t)pressureToWave(profileTargetPressureAt(second));
   }
 
   sendNextionCommand("addt " + String(BREW_WAVEFORM_ID) + "," +
@@ -2366,7 +2639,8 @@ bool drawTargetProfilePreview()
   }
 
   Serial.print("[DISPLAY] Profile preview drawn: "); Serial.print(activeProfileName);
-  Serial.print(" over "); Serial.print(totalSeconds); Serial.println("s");
+  Serial.print(" over "); Serial.print(totalSeconds, 1); Serial.print("s, ");
+  Serial.print(profilePointCount); Serial.println(" points");
   return true;
 }
 
@@ -2403,87 +2677,55 @@ void pressureProfile()
         }
         targetWeightReached = true;
         setPumpBrightness(0);
-        myNex.writeNum("n0.pco", 1535);
-        myNex.writeNum("n1.pco", 1535);
-        myNex.writeNum("setbar.val", 0);
+        writeBrewTimerColour(1535);
+        writeSetBarValue(0);
         return;
       }
     }
 
-    // Safety: if all profile segments have zero duration, the profile is not
-    // configured. Skip profiling so the pump is not silently killed. This is
-    // checked after the weight cut-off above so brew-by-weight still stops the
-    // shot when no profile is loaded.
-    int totalProfileTime = t1t + t2t + t3t + t4t;
-    if (totalProfileTime <= 0)
+    // Safety: a profile with no duration is not configured. Skip profiling so
+    // the pump is not silently killed. This is checked after the weight cut-off
+    // above so brew-by-weight still stops the shot when no profile is loaded.
+    float totalProfileSeconds = profileTotalSeconds();
+    if (totalProfileSeconds <= 0.0f)
     {
       setPumpBrightness(255);  // No profile configured → full power
       return;
     }
 
-    int brewSecs = (int)((millis() - activeBrewingStart) / 1000);
+    float brewSecs = (millis() - activeBrewingStart) / 1000.0f;
 
-    if (brewSecs <= t1t)
+    // profileTargetPressureAt() holds the last point's pressure once the
+    // profile has run out, letting the weight cut-off above — or the lever —
+    // end the shot. Cutting the pump here would end a brew-by-weight shot short
+    // of its target whenever the profile is shorter than the shot takes.
+    float target = profileTargetPressureAt(brewSecs);
+    writeSetBarValue(pressureToWave(target));
+    setPressure(target);
+
+    if (brewSecs > totalProfileSeconds)
     {
-      myNex.writeNum("setbar.val", t1pWave);
-      setPressure(t1p);
+      writeBrewTimerColour(1535);
     }
-    else if (brewSecs <= (t2t + t1t))
+    else if (totalProfileSeconds - brewSecs <= 3.0f)
     {
-      myNex.writeNum("setbar.val", t2pWave);
-      setPressure(t2p);
-    }
-    else if (brewSecs <= (t3t + t2t + t1t))
-    {
-      myNex.writeNum("setbar.val", t3pWave);
-      setPressure(t3p);
-    }
-    else if (brewSecs <= (t4t + t3t + t2t + t1t))
-    {
-      myNex.writeNum("setbar.val", t4pWave);
-      setPressure(t4p);
-
-      if ((t4t + t3t + t2t + t1t) - brewSecs <= 3)
-      {
-        myNex.writeNum("n0.pco", 64864);
-        myNex.writeNum("n1.pco", 64864);
-      }
-    }
-    else if (brewSecs > (t4t + t3t + t2t + t1t))
-    {
-      myNex.writeNum("n0.pco", 1535);
-      myNex.writeNum("n1.pco", 1535);
-
-      // The profile ran out of segments. Hold the last configured pressure and
-      // let the weight cut-off above — or the lever — end the shot. Cutting the
-      // pump here would end a brew-by-weight shot short of its target whenever
-      // the profile is shorter than the shot takes.
-      int holdPressure = t4p;
-      int holdWave = t4pWave;
-
-      if (t4t <= 0)
-      {
-        if (t3t > 0)
-        {
-          holdPressure = t3p;
-          holdWave = t3pWave;
-        }
-        else if (t2t > 0)
-        {
-          holdPressure = t2p;
-          holdWave = t2pWave;
-        }
-        else
-        {
-          holdPressure = t1p;
-          holdWave = t1pWave;
-        }
-      }
-
-      myNex.writeNum("setbar.val", holdWave);
-      setPressure(holdPressure);
+      writeBrewTimerColour(64864);
     }
   }
+}
+
+// Recolours the brew timer, skipping the write when the colour is unchanged —
+// this runs on every loop iteration during a shot.
+void writeBrewTimerColour(uint32_t colour)
+{
+  static uint32_t lastColour = 0xFFFFFFFFu;
+  if (colour == lastColour)
+  {
+    return;
+  }
+  lastColour = colour;
+  myNex.writeNum("n0.pco", colour);
+  myNex.writeNum("n1.pco", colour);
 }
 
 // Writes the brew button picture only when it actually changes. Sending it on
