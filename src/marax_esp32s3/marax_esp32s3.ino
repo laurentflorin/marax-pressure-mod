@@ -180,6 +180,29 @@ void resumeIdleBoilerFill();
 #define shots_topic              "marax/sensor/shots"
 #define power_topic              "marax/sensor/power_state"
 
+// Last-will topic: retained "online" while the ESP32 is connected, flipped to
+// "offline" by the broker the moment the connection drops. Every discovered
+// entity references it, so Home Assistant greys them out instead of showing a
+// stale retained reading when the controller is unplugged or loses WiFi.
+#define availability_topic       "marax/status"
+
+// ─────────────────────────────────────────────────────────────────────────
+// Home Assistant MQTT discovery
+//
+// With this enabled the controller publishes retained config payloads under
+// homeassistant/<component>/marax/<id>/config on every MQTT (re)connect, and
+// Home Assistant creates the entities itself — no YAML needed on the HA side.
+// Comment out to keep publishing plain values without announcing them.
+// ─────────────────────────────────────────────────────────────────────────
+#define ENABLE_HA_DISCOVERY
+
+#define ha_discovery_prefix      "homeassistant"
+#define ha_device_id             "marax"
+
+// Discovery payloads are ~400 bytes; PubSubClient's default 256-byte buffer
+// would silently drop them (publish() returns false and nothing reaches HA).
+#define MQTT_BUFFER_SIZE         768
+
 PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
 
 // nunununununununununununununununununununununununununununununun
@@ -682,6 +705,11 @@ void setup()
   lastScaleReconnectAttemptMs = millis();
 
 #ifndef DISABLE_WIFI_MQTT
+  if (!mqttClient.setBufferSize(MQTT_BUFFER_SIZE))
+  {
+    Serial.println("[MQTT] setBufferSize failed — discovery payloads will not fit");
+  }
+
   // WiFi — non-blocking, continue even if connection fails
   Serial.println("[DEBUG] Starting WiFi...");
   WiFi.setHostname("MaraXController");
@@ -1561,6 +1589,101 @@ void tryReconnectWifi()
 #endif
 }
 
+#if !defined(DISABLE_WIFI_MQTT) && defined(ENABLE_HA_DISCOVERY)
+
+// Every entity carries the same identifiers so Home Assistant files them all
+// under one device instead of eight loose entities.
+#define HA_DEVICE_BLOCK \
+  "\"dev\":{\"ids\":[\"" ha_device_id "\"],\"name\":\"Mara X\"," \
+  "\"mf\":\"Lelit\",\"mdl\":\"Mara X Pressure Mod\"}"
+
+// Available whenever the controller itself is online.
+#define HA_AVAILABILITY_BASE \
+  "\"avty\":[{\"t\":\"" availability_topic "\"}]"
+
+// Available only while the controller is online AND the machine is powered up.
+// Without this the temperature entities would sit at a retained 0 °C all night
+// and drag every history graph down to zero.
+#define HA_AVAILABILITY_POWERED \
+  "\"avty\":[{\"t\":\"" availability_topic "\"}," \
+  "{\"t\":\"" power_topic "\",\"pl_avail\":\"1\",\"pl_not_avail\":\"0\"}]," \
+  "\"avty_mode\":\"all\""
+
+// Builds and publishes one retained discovery payload. `attributes` carries the
+// entity-specific JSON (name, device class, unit, …) without a trailing comma.
+static bool publishHaEntity(const char *component,
+                            const char *objectId,
+                            const char *stateTopic,
+                            const char *attributes,
+                            bool requiresMachinePower)
+{
+  String topic = String(ha_discovery_prefix "/") + component + "/" ha_device_id "/" + objectId + "/config";
+
+  String payload = "{\"uniq_id\":\"" ha_device_id "_";
+  payload += objectId;
+  payload += "\",\"stat_t\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += attributes;
+  payload += ",";
+  payload += requiresMachinePower ? HA_AVAILABILITY_POWERED : HA_AVAILABILITY_BASE;
+  payload += "," HA_DEVICE_BLOCK "}";
+
+  bool ok = mqttClient.publish(topic.c_str(), payload.c_str(), true);
+  if (!ok)
+  {
+    Serial.print("[MQTT] Discovery publish failed for ");
+    Serial.print(objectId);
+    Serial.print(" (payload ");
+    Serial.print(payload.length());
+    Serial.println(" bytes)");
+  }
+  return ok;
+}
+
+// Re-announced on every reconnect: the payloads are retained, but republishing
+// makes the setup self-healing if the broker's retained store is ever cleared.
+void publishHaDiscovery()
+{
+  publishHaEntity("sensor", "brewtemp", brewtemp_topic,
+                  "\"name\":\"Brew temperature\",\"dev_cla\":\"temperature\","
+                  "\"unit_of_meas\":\"°C\",\"stat_cla\":\"measurement\",\"sug_dsp_prc\":0", true);
+
+  publishHaEntity("sensor", "steamtemp", steamtemp_topic,
+                  "\"name\":\"Steam temperature\",\"dev_cla\":\"temperature\","
+                  "\"unit_of_meas\":\"°C\",\"stat_cla\":\"measurement\",\"sug_dsp_prc\":0", true);
+
+  publishHaEntity("sensor", "steamtargettemp", steamtargettemp_topic,
+                  "\"name\":\"Steam target temperature\",\"dev_cla\":\"temperature\","
+                  "\"unit_of_meas\":\"°C\",\"stat_cla\":\"measurement\",\"sug_dsp_prc\":0", true);
+
+  publishHaEntity("sensor", "fastheat_timer", fastheat_topic,
+                  "\"name\":\"Fast heat countdown\",\"dev_cla\":\"duration\","
+                  "\"unit_of_meas\":\"s\",\"stat_cla\":\"measurement\"", true);
+
+  // Not power-gated: the shot count is cumulative and stays meaningful while
+  // the machine is off.
+  publishHaEntity("sensor", "shots", shots_topic,
+                  "\"name\":\"Shot count\",\"stat_cla\":\"total_increasing\","
+                  "\"ic\":\"mdi:coffee\"", false);
+
+  publishHaEntity("sensor", "debug", debug_topic,
+                  "\"name\":\"Serial frame\",\"ent_cat\":\"diagnostic\","
+                  "\"ic\":\"mdi:code-string\"", true);
+
+  publishHaEntity("binary_sensor", "heatingelement", heatingElement_topic,
+                  "\"name\":\"Heating element\",\"dev_cla\":\"running\","
+                  "\"pl_on\":\"1\",\"pl_off\":\"0\"", true);
+
+  // Not power-gated — this entity *is* the power state.
+  publishHaEntity("binary_sensor", "power_state", power_topic,
+                  "\"name\":\"Power\",\"dev_cla\":\"power\","
+                  "\"pl_on\":\"1\",\"pl_off\":\"0\"", false);
+
+  Serial.println("[MQTT] Home Assistant discovery published");
+}
+#endif
+
 void tryReconnectMqtt()
 {
 #ifndef DISABLE_WIFI_MQTT
@@ -1582,8 +1705,15 @@ void tryReconnectMqtt()
 
   lastMqttReconnectAttemptMs = now;
 
-  if (mqttClient.connect("MaraXMod", mqtt_user, mqtt_password))
+  // Retained last will: the broker publishes "offline" here for us if the
+  // connection dies without a clean disconnect.
+  if (mqttClient.connect("MaraXMod", mqtt_user, mqtt_password,
+                         availability_topic, 0, true, "offline"))
   {
+    mqttClient.publish(availability_topic, "online", true);
+#ifdef ENABLE_HA_DISCOVERY
+    publishHaDiscovery();
+#endif
   }
 #endif
 }
