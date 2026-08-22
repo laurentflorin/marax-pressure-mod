@@ -19,6 +19,8 @@ Everything is grouped under a single device named **Mara X**:
 | Serial frame | sensor | `marax/sensor/debug` | Raw GiCar frame, filed as a diagnostic entity |
 | Heating element | binary_sensor | `marax/sensor/heatingelement` | |
 | Power | binary_sensor | `marax/sensor/power_state` | |
+| Profile | select | `marax/profile/name` | Options are the profiles on the SD card |
+| Profile command result | sensor | `marax/profile/result` | Diagnostic; the answer to the last edit |
 
 ### Availability
 
@@ -82,6 +84,74 @@ differ.
 
 The device then lives at **Settings → Devices & Services → MQTT → Mara X**.
 
+## Editing profiles
+
+The controller also publishes the pressure profiles stored on its SD card and
+accepts edits back over MQTT. The **Profile** select entity is enough to switch
+profiles from a dashboard or an automation; the custom card below adds a curve
+you can drag.
+
+### Topics
+
+| Topic | Direction | Payload |
+| --- | --- | --- |
+| `marax/profile/list` | published, retained | Comma-separated profile file names |
+| `marax/profile/name` | published, retained | The loaded profile's file name |
+| `marax/profile/active` | published, retained | The loaded profile as v2 CSV |
+| `marax/profile/result` | published | `ok: …` or `error: …` for the last command |
+| `marax/profile/select` | subscribed | A profile file name to load |
+| `marax/profile/save/<name>` | subscribed | A v2 CSV body to write to `/profiles/<name>.csv` |
+| `marax/profile/delete/<name>` | subscribed | Any payload; deletes that profile |
+
+The same [v2 CSV](../profiles/profiles.md#the-v2-format) travels in both
+directions, so what you edit is byte for byte what the pump follows.
+
+A few rules the firmware enforces, each answered on the result topic:
+
+- **Commands during a shot are refused**, not queued. An edit must not land
+  seconds after the lever drops.
+- **Profile names may only contain letters, digits, underscore and dash.** They
+  become file names, and rejecting `.` rules out path traversal.
+- **A body is validated with the same parser that will later read it back**
+  off the card, so nothing can be accepted here and fail on reload.
+- **The loaded profile cannot be deleted.** Select another one first.
+- Saving the profile that is currently loaded reloads it immediately, so the
+  change takes effect without touching the machine.
+
+Switching profiles by hand, if you want it in an automation:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: marax/profile/select
+  payload: classic_espresso
+```
+
+### The curve editor card
+
+`homeassistant/marax-profile-card.js` in this repository is a self-contained
+Lovelace card — no HACS, no build step, no external dependencies.
+
+1. Copy it to `<config>/www/marax-profile-card.js`.
+2. **Settings → Dashboards → ⋮ → Resources → Add resource**, URL
+   `/local/marax-profile-card.js`, type **JavaScript module**.
+3. Add it to a dashboard:
+
+   ```yaml
+   type: custom:marax-profile-card
+   # prefix: marax    # only if you changed the MQTT topic prefix
+   ```
+
+Drag a point to move it, tap an empty part of the graph to add one, and use the
+row below the graph to type exact values, switch a point between ramp and jump,
+or remove it. A filled handle is a jump, an outlined one a ramp. The first
+point is pinned to t=0, since that is where the shot starts. **Save** writes
+back to the profile you loaded; **Save as…** writes a new file.
+
+The card reads MQTT through Home Assistant's websocket API, which is
+**available to admin users only** — a non-admin will see a subscribe error
+instead of the curve.
+
 ## Troubleshooting
 
 Watch what the controller actually sends:
@@ -103,6 +173,12 @@ mosquitto_sub -h 192.168.1.67 -u marax -P '<your-password>' -v -t 'marax/#' -t '
   sets `power_state` to `1` after it has seen a serial frame from the GiCar
   board, and clears it after 15 seconds of silence. Check the *Serial frame*
   diagnostic entity.
+- **The card says "Cannot subscribe to MQTT"** — the logged-in Home Assistant
+  user is not an admin, or the MQTT integration is not set up.
+- **An edit reports `error: brew in progress`** — commands are refused during a
+  shot by design. Try again once the lever is back.
+- **An edit reports `error: profile body rejected by the parser`** — most often
+  points that are not in ascending time order, or fewer than two of them.
 - **A renamed or removed entity lingers** — the discovery payloads are
   retained. Clear the old one with an empty retained message:
   ```sh

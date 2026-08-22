@@ -1,0 +1,18 @@
+# marax profile v2
+#
+# The v2 format: one `point` per line, `point,<seconds>,<bar>,<ramp|jump>`,
+# in ascending time order. `seconds` is measured from the start of the shot,
+# not a segment length.
+#
+#   ramp — pressure moves linearly from the previous point to this one
+#   jump — the previous pressure is held until this point's time, then steps
+#
+# This profile holds 3 bar for the pre-infusion, jumps straight to 9, holds it,
+# then ramps down to 6 and holds that until the shot ends.
+name,Mixed ramp and jump
+target_weight,36.0
+point,0.0,3.0,ramp
+point,8.0,9.0,jump
+point,16.0,9.0,ramp
+point,26.0,6.0,ramp
+point,34.0,6.0,ramp
