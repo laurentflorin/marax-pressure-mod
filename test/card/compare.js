@@ -72,6 +72,72 @@ for (const [label, csv] of Object.entries(cases)) {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${label.padEnd(46)} max delta ${worst.toFixed(5)} bar at ${worstAt}s`);
 }
 
+// ── When an incoming profile replaces what is on screen ──────────────────
+//
+// Local edits have to survive the controller repeating itself, but must not
+// keep the old profile on screen once the machine has actually loaded a
+// different one. Getting this backwards showed the previous profile until the
+// user pressed Revert.
+function extractMethod(name) {
+  const start = cardSource.indexOf("  " + name + "(");
+  let depth = 0;
+  for (let i = cardSource.indexOf("{", start); i < cardSource.length; i++) {
+    if (cardSource[i] === "{") depth++;
+    else if (cardSource[i] === "}" && --depth === 0) {
+      return "function " + cardSource.slice(start, i + 1).trim();
+    }
+  }
+  throw new Error("could not extract " + name);
+}
+const adoptProfile = new Function(helpers + "\nreturn " + extractMethod("_adoptProfile") + ";")();
+
+const A = "name,A\npoint,0.0,3.0,ramp\npoint,20.0,9.0,ramp\n";
+const B = "name,B\npoint,0.0,6.0,ramp\npoint,30.0,4.0,ramp\n";
+
+function state(profileCsv, loadedCsv) {
+  return {
+    _profile: profileCsv ? parseProfileCsv(profileCsv) : null,
+    _loaded: loadedCsv ? parseProfileCsv(loadedCsv) : null,
+    _selected: 3,
+    _status: "",
+  };
+}
+function adopt(s, csv) { adoptProfile.call(s, parseProfileCsv(csv)); return s; }
+function shows(s, csv) { return formatProfileCsv(s._profile) === formatProfileCsv(parseProfileCsv(csv)); }
+function dirty(s) { return formatProfileCsv(s._profile) !== formatProfileCsv(s._loaded); }
+
+function scenario(label, ok) {
+  if (!ok) failures++;
+  console.log(`  ${ok ? "PASS" : "FAIL"}  ${label}`);
+}
+
+console.log("\nadopting an incoming profile");
+
+let s1 = adopt(state(null, null), A);
+scenario("a first message is adopted", shows(s1, A) && !dirty(s1));
+
+let s2 = adopt(state(A, A), A);
+scenario("the same profile resent leaves the screen alone", shows(s2, A) && !dirty(s2));
+
+// Edited A: the screen holds an edit the controller has not seen.
+const editedA = "name,A\npoint,0.0,5.0,ramp\npoint,20.0,9.0,ramp\n";
+let s3 = adopt(state(editedA, A), A);
+scenario("a retained resend does not wipe unsaved edits", shows(s3, editedA) && dirty(s3));
+
+// The reported bug: switching profiles while holding unsaved edits.
+let s4 = adopt(state(editedA, A), B);
+scenario("switching profiles while dirty shows the new profile", shows(s4, B));
+scenario("...and says the edits were discarded", /discarded/.test(s4._status));
+scenario("...and clears the selected point", s4._selected === -1);
+
+let s5 = adopt(state(A, A), B);
+scenario("switching profiles when clean shows the new profile", shows(s5, B) && !dirty(s5));
+scenario("...without claiming anything was discarded", s5._status === "");
+
+// Our own save coming back: the screen already matches, nothing was lost.
+let s6 = adopt(state(editedA, A), editedA);
+scenario("our own save lands silently", shows(s6, editedA) && !dirty(s6) && s6._status === "");
+
 // The card must also round-trip the firmware's own serialisation untouched.
 const body = "# marax profile v2\nname,Mixed\ntarget_weight,36.0\n" +
              "point,0.0,3.0,ramp\npoint,6.0,8.0,jump\npoint,30.0,6.0,ramp\n";

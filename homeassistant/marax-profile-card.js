@@ -119,6 +119,8 @@ class MaraxProfileCard extends HTMLElement {
     this._loaded = null;       // what the controller last sent, for Revert
     this._profileList = [];
     this._activeName = "";
+    this._controllerStem = "";  // the file the machine says it has loaded
+    this._pendingStem = "";     // a switch we asked for but have not seen land
     this._status = "Waiting for the machine…";
     this._selected = -1;
     this._dragging = -1;
@@ -153,7 +155,7 @@ class MaraxProfileCard extends HTMLElement {
 
   async _subscribe() {
     if (!this._hass || this._subscriptions.length) return;
-    const topics = ["active", "list", "result"];
+    const topics = ["active", "list", "name", "result"];
     // Claim the slot before awaiting, so a second call cannot subscribe twice.
     this._subscriptions = topics.map(() => null);
     try {
@@ -182,21 +184,59 @@ class MaraxProfileCard extends HTMLElement {
     const payload = message.payload || "";
     if (leaf === "list") {
       this._profileList = payload.split(",").map((s) => s.trim()).filter(Boolean);
+    } else if (leaf === "name") {
+      // Authoritative: the file the machine actually has loaded. Trusting this
+      // over what was last clicked means the picker corrects itself when a
+      // profile is changed at the machine, and cannot get stuck showing a
+      // selection that never took.
+      this._controllerStem = payload.trim();
+      this._pendingStem = "";
     } else if (leaf === "result") {
       this._status = payload;
+      // A rejected switch never produces a name update, so release the
+      // optimistic selection here or the picker would keep showing it.
+      if (/^error/.test(payload)) this._pendingStem = "";
     } else if (leaf === "active") {
-      const parsed = parseProfileCsv(payload);
-      this._loaded = parsed;
-      // Do not throw away edits in progress just because a retained message
-      // arrived; only adopt the controller's copy when there is nothing local.
-      if (!this._profile || !this._dirty()) {
-        this._profile = JSON.parse(JSON.stringify(parsed));
-        this._selected = -1;
-      }
-      this._activeName = parsed.name;
+      this._adoptProfile(parseProfileCsv(payload));
       if (this._status === "Waiting for the machine…") this._status = "";
     }
     this._render();
+  }
+
+  /*
+   * Decides whether an incoming profile replaces what is on screen.
+   *
+   * Local edits must survive the controller merely repeating itself — a
+   * retained message on reconnect, or a republish triggered by something
+   * unrelated. But when the controller genuinely moves on, because a different
+   * profile was selected or the file changed elsewhere, the screen has to
+   * follow: continuing to show the old profile while the machine has loaded a
+   * new one is worse than losing an unsaved edit, and silently disagreeing
+   * with the machine is the one thing this card must never do.
+   */
+  _adoptProfile(parsed) {
+    const incoming = formatProfileCsv(parsed);
+    const local = this._profile ? formatProfileCsv(this._profile) : null;
+    const previous = this._loaded ? formatProfileCsv(this._loaded) : null;
+    const previousName = this._profile ? this._profile.name : "";
+    this._loaded = parsed;
+
+    if (local === incoming) {
+      // Already identical — usually our own save coming back. Nothing to
+      // replace, and _loaded is now up to date so the edits read as saved.
+      return;
+    }
+    if (local !== null && incoming === previous) {
+      // The controller is repeating what it last sent; keep the edits.
+      return;
+    }
+
+    const hadEdits = local !== null && local !== previous;
+    this._profile = JSON.parse(JSON.stringify(parsed));
+    this._selected = -1;
+    if (hadEdits) {
+      this._status = "Switched profile — unsaved changes to '" + previousName + "' were discarded";
+    }
   }
 
   _publish(topic, payload) {
@@ -335,10 +375,12 @@ class MaraxProfileCard extends HTMLElement {
     this._statusLine.className = /^error/.test(this._status) ? "status error" : "status";
   }
 
+  // The file name to show in the picker and save back to. `_pendingStem` gives
+  // the dropdown immediate feedback; the machine's own answer replaces it a
+  // moment later, or an error clears it.
   _activeStem() {
-    // The list holds file stems; the profile's name field may differ from it.
-    const select = this._select && this._select.dataset.stem;
-    return select || (this._profileList.includes(this._activeName) ? this._activeName : this._profileList[0]);
+    return this._pendingStem || this._controllerStem ||
+           (this._profileList.includes(this._activeName) ? this._activeName : this._profileList[0]);
   }
 
   _updateChart() {
@@ -461,8 +503,9 @@ class MaraxProfileCard extends HTMLElement {
     this._select = document.createElement("select");
     this._select.title = "Load a profile from the SD card";
     this._select.addEventListener("change", () => {
-      this._select.dataset.stem = this._select.value;
+      this._pendingStem = this._select.value;
       this._publish(this._prefix + "/profile/select", this._select.value);
+      this._render();
     });
     head.appendChild(this._select);
 

@@ -177,6 +177,12 @@ or remove it. A filled handle is a jump, an outlined one a ramp. The first
 point is pinned to t=0, since that is where the shot starts. **Save** writes
 back to the profile you loaded; **Save as…** writes a new file.
 
+Switching profiles in the picker always shows the newly loaded one, discarding
+any unsaved edits and saying so in the status line — the card showing a
+different profile from the one the machine has loaded would be worse than
+losing an edit. Edits do survive the controller simply repeating itself, such
+as the retained profile arriving again after a reconnect.
+
 The card reads MQTT through Home Assistant's websocket API, which is
 **available to admin users only** — a non-admin will see a subscribe error
 instead of the curve.
