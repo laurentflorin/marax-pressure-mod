@@ -29,6 +29,9 @@ funcs = [
     grab(r"^void applyManualStepsToProfile"),
     grab(r"^uint32_t profileSegmentSignature"),
     grab(r"^int pressureToWave"),
+    grab(r"^static bool sanitizeProfileStem"),
+    grab(r"^void buildProfileCsv"),
+    grab(r"^static bool validateProfileBody"),
 ]
 
 prelude = '''#include <string>
@@ -57,6 +60,10 @@ struct String {
     size_t b = s.find_last_not_of(" \\t\\r\\n");
     s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
   }
+  String(const char *c) : s(c) {}
+  String(float v, int digits) { char b[32]; std::snprintf(b, sizeof(b), "%.*f", digits, v); s = b; }
+  String &operator+=(const String &o) { s += o.s; return *this; }
+  String &operator+=(const char *c) { s += c; return *this; }
   void remove(size_t i, size_t n) { s.erase(i, n); }\n  void toCharArray(char *buf, size_t n) const { std::snprintf(buf, n, "%s", s.c_str()); }
 };
 

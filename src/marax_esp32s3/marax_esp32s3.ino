@@ -164,6 +164,9 @@ bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
 void resumeIdleBoilerFill();
 void applyManualStepsToProfile();
+void publishProfileState();
+void processPendingProfileCommand();
+void buildProfileCsv(String &out);
 float profileTotalSeconds();
 float profileTargetPressureAt(float second);
 int pressureToWave(float bar);
@@ -192,6 +195,22 @@ void writeSetBarValue(int wave);
 // stale retained reading when the controller is unplugged or loses WiFi.
 #define availability_topic       "marax/status"
 
+// Profile editing. The controller publishes the profile list, the active
+// profile's name and its full body; commands arrive on the select/save/delete
+// topics and every one of them is answered on the result topic.
+//
+// The body is the same v2 CSV that lives on the SD card, in both directions.
+// Carrying one format end to end means the firmware never has to parse JSON:
+// it validates the bytes with the reader it already has and writes them
+// straight to the card.
+#define profile_list_topic       "marax/profile/list"
+#define profile_name_topic       "marax/profile/name"
+#define profile_active_topic     "marax/profile/active"
+#define profile_result_topic     "marax/profile/result"
+#define profile_select_topic     "marax/profile/select"
+#define profile_save_prefix      "marax/profile/save/"
+#define profile_delete_prefix    "marax/profile/delete/"
+
 // ─────────────────────────────────────────────────────────────────────────
 // Home Assistant MQTT discovery
 //
@@ -205,11 +224,47 @@ void writeSetBarValue(int wave);
 #define ha_discovery_prefix      "homeassistant"
 #define ha_device_id             "marax"
 
-// Discovery payloads are ~400 bytes; PubSubClient's default 256-byte buffer
-// would silently drop them (publish() returns false and nothing reaches HA).
-#define MQTT_BUFFER_SIZE         768
+// PubSubClient's default 256-byte buffer would silently drop every payload
+// bigger than that (publish() just returns false). The largest traffic here is
+// a full profile body and the profile-select discovery payload, which carries
+// one option per profile on the card.
+#define MQTT_BUFFER_SIZE         2048
+// Profile bodies are bounded so an oversized retained payload cannot be
+// accepted and then fail to fit in the buffer on the way back out.
+#define PROFILE_BODY_MAX_LEN     1024
+// The select entity announces the profiles as options. Beyond this the payload
+// would not fit the buffer, so the list is cut and the truncation logged
+// rather than losing the whole announcement.
+#define PROFILE_SELECT_MAX_OPTIONS 40
 
 PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
+
+// MQTT commands are recorded by the callback and carried out later from the
+// main loop. The callback runs inside mqttClient.loop(); writing to the SD card
+// or publishing from in there would re-enter the client and stall the loop at
+// an arbitrary moment — including in the middle of a shot.
+enum ProfileCommandKind
+{
+  PROFILE_CMD_NONE = 0,
+  PROFILE_CMD_SELECT,
+  PROFILE_CMD_SAVE,
+  PROFILE_CMD_DELETE,
+  PROFILE_CMD_TOO_LARGE  // recorded so the sender gets an answer either way
+};
+
+struct PendingProfileCommand
+{
+  ProfileCommandKind kind;
+  char stem[PROFILE_NAME_MAX_LEN];
+  char body[PROFILE_BODY_MAX_LEN];
+  unsigned int bodyLength;
+};
+
+PendingProfileCommand pendingProfileCommand = { PROFILE_CMD_NONE, "", "", 0 };
+// Set whenever the profile list or the active profile changes, so the retained
+// topics are refreshed from the main loop rather than from wherever the change
+// happened to occur.
+bool profileStateDirty = true;
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu CONSTS
@@ -873,6 +928,9 @@ void loop()
   handleOTA();  // Non-blocking: services OTA and (re)connects WiFi in background
 #endif
   checkPendingObservation();
+#ifndef DISABLE_WIFI_MQTT
+  processPendingProfileCommand();
+#endif
 
   handleNextionProfileTouchEvents();
 
@@ -891,14 +949,80 @@ void loop()
 
 void callbackfun(char *topic, byte *payload, unsigned int length)
 {
-  (void)topic;
-  (void)payload;
-  (void)length;
+#ifdef DISABLE_WIFI_MQTT
+  (void)topic; (void)payload; (void)length;
+#else
+  if (topic == NULL)
+  {
+    return;
+  }
+
+  // One command at a time. Dropping the newer one is the safe choice: the
+  // alternative is a queue that can fill up mid-shot.
+  if (pendingProfileCommand.kind != PROFILE_CMD_NONE)
+  {
+    Serial.println("[MQTT] Profile command dropped — one is already pending");
+    return;
+  }
+
+  ProfileCommandKind kind = PROFILE_CMD_NONE;
+  const char *stem = NULL;
+
+  if (strcmp(topic, profile_select_topic) == 0)
+  {
+    kind = PROFILE_CMD_SELECT;
+  }
+  else if (strncmp(topic, profile_save_prefix, strlen(profile_save_prefix)) == 0)
+  {
+    kind = PROFILE_CMD_SAVE;
+    stem = topic + strlen(profile_save_prefix);
+  }
+  else if (strncmp(topic, profile_delete_prefix, strlen(profile_delete_prefix)) == 0)
+  {
+    kind = PROFILE_CMD_DELETE;
+    stem = topic + strlen(profile_delete_prefix);
+  }
+  else
+  {
+    return;
+  }
+
+  if (length >= sizeof(pendingProfileCommand.body))
+  {
+    pendingProfileCommand.kind = PROFILE_CMD_TOO_LARGE;
+    pendingProfileCommand.bodyLength = 0;
+    pendingProfileCommand.body[0] = '\0';
+    pendingProfileCommand.stem[0] = '\0';
+    return;
+  }
+
+  pendingProfileCommand.stem[0] = '\0';
+  if (stem != NULL)
+  {
+    strncpy(pendingProfileCommand.stem, stem, sizeof(pendingProfileCommand.stem) - 1);
+    pendingProfileCommand.stem[sizeof(pendingProfileCommand.stem) - 1] = '\0';
+  }
+
+  memcpy(pendingProfileCommand.body, payload, length);
+  pendingProfileCommand.body[length] = '\0';
+  pendingProfileCommand.bodyLength = length;
+  // Written last: the main loop reads `kind` to decide whether the rest of the
+  // struct is populated.
+  pendingProfileCommand.kind = kind;
+#endif
 }
 
 void updateMqtt()
 {
 #ifndef DISABLE_WIFI_MQTT
+  // Profile changes are published as they happen rather than on the 5-second
+  // tick, so the editor sees its own save land immediately.
+  if (profileStateDirty && mqttClient.connected() && !brewActive)
+  {
+    publishProfileState();
+    profileStateDirty = false;
+  }
+
   if ((millis() - updateMqttTimer > 5000) && !brewActive && POWER_ON)
   {
     mqttClient.publish(debug_topic, toCharArray(String(receivedCharsFromMarax)), true);
@@ -1118,6 +1242,7 @@ bool selectProfile(int profileIndex)
   }
 
   selectedProfileIndex = profileIndex;
+  profileStateDirty = true;
   myNex.writeStr("actProfile.txt", activeProfileName);
   updateProfileModeText();
   persistSelectedProfile();
@@ -1830,6 +1955,46 @@ static bool publishHaEntity(const char *component,
   return ok;
 }
 
+// The profile picker. Its options are the profiles on the card, so unlike the
+// other entities this has to be re-announced whenever that list changes —
+// publishProfileState() calls it for exactly that reason.
+void publishHaProfileSelect()
+{
+  String options = "";
+  int announced = 0;
+  for (int i = 0; i < profileCount && announced < PROFILE_SELECT_MAX_OPTIONS; i++)
+  {
+    String stem = profileNames[i];
+    if (stem.endsWith(".csv"))
+    {
+      stem = stem.substring(0, stem.length() - 4);
+    }
+    if (options.length() > 0)
+    {
+      options += ",";
+    }
+    // Appended one piece at a time: on Arduino a bare string literal on the
+    // left of + is not a String concatenation.
+    options += "\"";
+    options += stem;
+    options += "\"";
+    announced++;
+  }
+
+  if (announced < profileCount)
+  {
+    Serial.print("[MQTT] Profile select truncated to "); Serial.print(announced);
+    Serial.print(" of "); Serial.print(profileCount); Serial.println(" profiles");
+  }
+
+  String attributes = "\"name\":\"Profile\",\"ic\":\"mdi:chart-bell-curve-cumulative\","
+                      "\"cmd_t\":\"" profile_select_topic "\",\"ops\":[";
+  attributes += options;
+  attributes += "]";
+
+  publishHaEntity("select", "profile", profile_name_topic, attributes.c_str(), false);
+}
+
 // Re-announced on every reconnect: the payloads are retained, but republishing
 // makes the setup self-healing if the broker's retained store is ever cleared.
 void publishHaDiscovery()
@@ -1869,7 +2034,388 @@ void publishHaDiscovery()
                   "\"name\":\"Power\",\"dev_cla\":\"power\","
                   "\"pl_on\":\"1\",\"pl_off\":\"0\"", false);
 
+  // Every profile command is answered here, so a rejected edit is visible in
+  // Home Assistant instead of only on the serial console.
+  publishHaEntity("sensor", "profile_result", profile_result_topic,
+                  "\"name\":\"Profile command result\",\"ent_cat\":\"diagnostic\","
+                  "\"ic\":\"mdi:message-alert-outline\"", false);
+
+  publishHaProfileSelect();
+
   Serial.println("[MQTT] Home Assistant discovery published");
+}
+#endif
+
+#ifndef DISABLE_WIFI_MQTT
+
+// Profile names become file names, so only characters that cannot escape the
+// /profiles directory are allowed. Rejecting '.' outright rules out '..' and
+// any extension games without needing to reason about path traversal.
+static bool sanitizeProfileStem(const char *raw, char *out, size_t outLen)
+{
+  if (raw == NULL)
+  {
+    return false;
+  }
+
+  size_t length = strlen(raw);
+  // Room for the stem plus the ".csv" the caller appends.
+  if (length == 0 || length + 5 > outLen)
+  {
+    return false;
+  }
+
+  for (size_t i = 0; i < length; i++)
+  {
+    char c = raw[i];
+    bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_' || c == '-';
+    if (!allowed)
+    {
+      return false;
+    }
+    out[i] = c;
+  }
+  out[length] = '\0';
+  return true;
+}
+
+// Serialises the loaded profile back into the v2 format — the same bytes that
+// are written to the card, so what Home Assistant edits is what is stored.
+void buildProfileCsv(String &out)
+{
+  out = "# marax profile v2\n";
+  out += "name,";
+  out += activeProfileName;
+  out += "\n";
+
+  if (profileTargetWeightField > 0.0f)
+  {
+    out += "target_weight,";
+    out += String(profileTargetWeightField, 1);
+    out += "\n";
+  }
+
+  for (int i = 0; i < profilePointCount; i++)
+  {
+    out += "point,";
+    out += String(profilePoints[i].seconds, 1);
+    out += ",";
+    out += String(profilePoints[i].bar, 1);
+    out += profilePoints[i].jump ? ",jump\n" : ",ramp\n";
+  }
+}
+
+// Parses a body with the real reader, then puts back whatever was loaded
+// before. Validating with the same code that will later read the file off the
+// card is the point: nothing can be accepted here and rejected on reload.
+static bool validateProfileBody(const char *body)
+{
+  ProfilePoint savedPoints[MAX_PROFILE_POINTS];
+  char savedName[PROFILE_NAME_MAX_LEN];
+  int savedCount = profilePointCount;
+  float savedWeight = profileTargetWeightField;
+  memcpy(savedPoints, profilePoints, sizeof(savedPoints));
+  strncpy(savedName, activeProfileName, sizeof(savedName));
+
+  profilePointCount = 0;
+  profileTargetWeightField = 0.0f;
+
+  bool ok = true;
+  const char *cursor = body;
+  char line[PROFILE_CSV_BUFFER_LEN];
+
+  while (*cursor != '\0' && ok)
+  {
+    size_t n = 0;
+    while (*cursor != '\0' && *cursor != '\n' && n < sizeof(line) - 1)
+    {
+      line[n++] = *cursor++;
+    }
+    // Ran out of buffer before the end of the line: malformed, not something
+    // to truncate silently.
+    if (*cursor != '\0' && *cursor != '\n')
+    {
+      ok = false;
+      break;
+    }
+    if (*cursor == '\n')
+    {
+      cursor++;
+    }
+    line[n] = '\0';
+
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t'))
+    {
+      line[--n] = '\0';
+    }
+
+    if (n == 0 || line[0] == '#')
+    {
+      continue;
+    }
+    if (!parseProfileV2Line(line))
+    {
+      ok = false;
+    }
+  }
+
+  if (ok && profilePointCount < PROFILE_MIN_POINTS)
+  {
+    ok = false;
+  }
+
+  memcpy(profilePoints, savedPoints, sizeof(profilePoints));
+  profilePointCount = savedCount;
+  profileTargetWeightField = savedWeight;
+  strncpy(activeProfileName, savedName, sizeof(activeProfileName));
+  return ok;
+}
+
+static bool writeProfileFile(const char *stem, const char *body)
+{
+  if (!SD.exists("/profiles"))
+  {
+    SD.mkdir("/profiles");
+  }
+
+  char path[MAX_PATH_LEN];
+  snprintf(path, sizeof(path), "/profiles/%s.csv", stem);
+
+  // On the ESP32 core FILE_WRITE is "w", so this replaces the file rather than
+  // appending to it.
+  File f = SD.open(path, FILE_WRITE);
+  if (!f)
+  {
+    Serial.print("[SD] writeProfileFile: cannot open "); Serial.println(path);
+    return false;
+  }
+
+  size_t expected = strlen(body);
+  size_t written = f.print(body);
+  // The reader takes a line at a time, so a body that does not end in a
+  // newline would lose its last point on the way back in.
+  if (expected > 0 && body[expected - 1] != '\n')
+  {
+    f.print('\n');
+  }
+  f.close();
+
+  if (written != expected)
+  {
+    Serial.print("[SD] writeProfileFile: short write to "); Serial.println(path);
+    return false;
+  }
+
+  Serial.print("[SD] writeProfileFile: wrote "); Serial.print(written);
+  Serial.print(" bytes to "); Serial.println(path);
+  return true;
+}
+
+static void publishProfileResult(const char *text)
+{
+  Serial.print("[MQTT] Profile command: "); Serial.println(text);
+  // Not retained: this is the answer to one command, not a state a fresh
+  // subscriber should be handed on connect.
+  mqttClient.publish(profile_result_topic, text, false);
+}
+
+// Refreshes the retained profile topics. Called from the main loop whenever
+// profileStateDirty is set, so callers only have to flag the change.
+void publishProfileState()
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  String list = "";
+  for (int i = 0; i < profileCount; i++)
+  {
+    String stem = profileNames[i];
+    if (stem.endsWith(".csv"))
+    {
+      stem = stem.substring(0, stem.length() - 4);
+    }
+    if (list.length() > 0)
+    {
+      list += ",";
+    }
+    list += stem;
+  }
+
+  mqttClient.publish(profile_list_topic, list.c_str(), true);
+  mqttClient.publish(profile_name_topic, activeProfileFileStem, true);
+
+  String csv;
+  buildProfileCsv(csv);
+  if (!mqttClient.publish(profile_active_topic, csv.c_str(), true))
+  {
+    Serial.print("[MQTT] Active profile body did not fit the buffer (");
+    Serial.print(csv.length()); Serial.println(" bytes)");
+  }
+
+#ifdef ENABLE_HA_DISCOVERY
+  publishHaProfileSelect();
+#endif
+}
+
+// Finds a profile by stem in the scanned list. Returns -1 when it is not there.
+static int findProfileIndex(const char *stem)
+{
+  char wanted[PROFILE_NAME_MAX_LEN];
+  snprintf(wanted, sizeof(wanted), "%s.csv", stem);
+  for (int i = 0; i < profileCount; i++)
+  {
+    if (strcmp(profileNames[i], wanted) == 0)
+    {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Carries out whatever the MQTT callback recorded. Runs from the main loop so
+// the SD card is only touched at a moment of our choosing.
+void processPendingProfileCommand()
+{
+  ProfileCommandKind kind = pendingProfileCommand.kind;
+  if (kind == PROFILE_CMD_NONE)
+  {
+    return;
+  }
+
+  if (!mqttClient.connected())
+  {
+    // Nowhere to report the outcome; drop it rather than acting unannounced.
+    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    return;
+  }
+
+  if (kind == PROFILE_CMD_TOO_LARGE)
+  {
+    publishProfileResult("error: profile body too large");
+    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    return;
+  }
+
+  // Never write to the card or change the running profile mid-shot. Refusing
+  // outright is clearer than queueing the command to land seconds later.
+  if (brewActive)
+  {
+    publishProfileResult("error: brew in progress");
+    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    return;
+  }
+
+  if (!sdReady)
+  {
+    publishProfileResult("error: no SD card");
+    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    return;
+  }
+
+  char stem[PROFILE_NAME_MAX_LEN];
+  char message[96];
+
+  if (kind == PROFILE_CMD_SELECT)
+  {
+    // For select the stem arrives as the payload, not in the topic.
+    if (!sanitizeProfileStem(pendingProfileCommand.body, stem, sizeof(stem)))
+    {
+      publishProfileResult("error: invalid profile name");
+    }
+    else
+    {
+      int index = findProfileIndex(stem);
+      if (index < 0)
+      {
+        snprintf(message, sizeof(message), "error: no profile '%s'", stem);
+        publishProfileResult(message);
+      }
+      else if (!selectProfile(index))
+      {
+        snprintf(message, sizeof(message), "error: could not load '%s'", stem);
+        publishProfileResult(message);
+      }
+      else
+      {
+        snprintf(message, sizeof(message), "ok: selected '%s'", stem);
+        publishProfileResult(message);
+      }
+    }
+  }
+  else if (kind == PROFILE_CMD_SAVE)
+  {
+    if (!sanitizeProfileStem(pendingProfileCommand.stem, stem, sizeof(stem)))
+    {
+      publishProfileResult("error: invalid profile name");
+    }
+    else if (!validateProfileBody(pendingProfileCommand.body))
+    {
+      publishProfileResult("error: profile body rejected by the parser");
+    }
+    else if (!writeProfileFile(stem, pendingProfileCommand.body))
+    {
+      publishProfileResult("error: could not write to the SD card");
+    }
+    else
+    {
+      scanProfiles();
+      lastProfileScanMs = millis();
+
+      // Editing the profile that is loaded should take effect straight away.
+      if (strcmp(stem, activeProfileFileStem) == 0)
+      {
+        int index = findProfileIndex(stem);
+        if (index >= 0)
+        {
+          selectProfile(index);
+        }
+      }
+
+      profileStateDirty = true;
+      snprintf(message, sizeof(message), "ok: saved '%s'", stem);
+      publishProfileResult(message);
+    }
+  }
+  else if (kind == PROFILE_CMD_DELETE)
+  {
+    if (!sanitizeProfileStem(pendingProfileCommand.stem, stem, sizeof(stem)))
+    {
+      publishProfileResult("error: invalid profile name");
+    }
+    else if (strcmp(stem, activeProfileFileStem) == 0)
+    {
+      // Deleting the loaded profile would leave the pump following something
+      // with no file behind it, and the picker pointing at a name that is gone.
+      publishProfileResult("error: select another profile first");
+    }
+    else if (findProfileIndex(stem) < 0)
+    {
+      snprintf(message, sizeof(message), "error: no profile '%s'", stem);
+      publishProfileResult(message);
+    }
+    else
+    {
+      char path[MAX_PATH_LEN];
+      snprintf(path, sizeof(path), "/profiles/%s.csv", stem);
+      if (!SD.remove(path))
+      {
+        publishProfileResult("error: could not delete the file");
+      }
+      else
+      {
+        scanProfiles();
+        lastProfileScanMs = millis();
+        profileStateDirty = true;
+        snprintf(message, sizeof(message), "ok: deleted '%s'", stem);
+        publishProfileResult(message);
+      }
+    }
+  }
+
+  pendingProfileCommand.kind = PROFILE_CMD_NONE;
 }
 #endif
 
@@ -1900,6 +2446,13 @@ void tryReconnectMqtt()
                          availability_topic, 0, true, "offline"))
   {
     mqttClient.publish(availability_topic, "online", true);
+
+    mqttClient.subscribe(profile_select_topic);
+    mqttClient.subscribe(profile_save_prefix "+");
+    mqttClient.subscribe(profile_delete_prefix "+");
+    // The retained profile topics are refreshed from the main loop.
+    profileStateDirty = true;
+
 #ifdef ENABLE_HA_DISCOVERY
     publishHaDiscovery();
 #endif

@@ -139,6 +139,56 @@ int main() {
   check(pressureToWave(5.0f) == 90,   "5 bar maps to half scale");
   check(pressureToWave(12.0f) == 180, "over-scale is clamped");
 
+  // ── Profile names become file names ────────────────────────────────────
+  std::printf("\nprofile name sanitising\n");
+  char stem[PROFILE_NAME_MAX_LEN];
+  check(sanitizeProfileStem("classic_espresso", stem, sizeof(stem)), "accepts a normal name");
+  check(std::strcmp(stem, "classic_espresso") == 0, "passes it through unchanged");
+  check(sanitizeProfileStem("Turbo-2", stem, sizeof(stem)), "accepts digits, caps and a dash");
+  check(!sanitizeProfileStem("../../etc/passwd", stem, sizeof(stem)), "rejects path traversal");
+  check(!sanitizeProfileStem("my profile", stem, sizeof(stem)), "rejects spaces");
+  check(!sanitizeProfileStem("shot.csv", stem, sizeof(stem)), "rejects a dot");
+  check(!sanitizeProfileStem("", stem, sizeof(stem)), "rejects an empty name");
+  check(!sanitizeProfileStem("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stem, sizeof(stem)),
+        "rejects a name with no room left for .csv");
+
+  // ── What is written back must read back identically ────────────────────
+  std::printf("\nround trip through buildProfileCsv\n");
+  const char *source =
+    "# marax profile v2\n"
+    "name,Mixed\n"
+    "target_weight,36.0\n"
+    "point,0.0,3.0,ramp\n"
+    "point,6.0,8.0,jump\n"
+    "point,14.0,8.0,ramp\n"
+    "point,22.0,6.0,ramp\n"
+    "point,30.0,6.0,ramp\n";
+  check(loadFromText(source), "source parses");
+  std::snprintf(activeProfileName, sizeof(activeProfileName), "%s", "Mixed");
+  String rebuilt;
+  buildProfileCsv(rebuilt);
+  check(rebuilt.s == source, "serialises back to byte-identical CSV");
+  float before[8];
+  for (int i = 0; i < 8; i++) before[i] = profileTargetPressureAt(i * 4.0f);
+  check(loadFromText(rebuilt.s), "the serialised form parses again");
+  bool same = true;
+  for (int i = 0; i < 8; i++) if (std::fabs(before[i] - profileTargetPressureAt(i * 4.0f)) > 0.001f) same = false;
+  check(same, "and describes the same curve");
+
+  // ── Validation must not disturb the profile the pump is following ──────
+  std::printf("\nvalidation is side-effect free\n");
+  loadFromText("name,Loaded\npoint,0,4\npoint,20,9\n");
+  std::snprintf(activeProfileName, sizeof(activeProfileName), "%s", "Loaded");
+  uint32_t signatureBefore = profileSegmentSignature();
+  check(validateProfileBody("name,Other\npoint,0,1\npoint,5,2\npoint,9,3\n"), "accepts a good body");
+  check(profileSegmentSignature() == signatureBefore, "loaded profile untouched after accepting");
+  check(std::strcmp(activeProfileName, "Loaded") == 0, "loaded name untouched after accepting");
+  check(!validateProfileBody("name,Bad\npoint,10,6\npoint,4,9\n"), "rejects out-of-order points");
+  check(profileSegmentSignature() == signatureBefore, "loaded profile untouched after rejecting");
+  check(!validateProfileBody("name,Bad\npoint,0,6\n"), "rejects a single-point body");
+  check(!validateProfileBody(""), "rejects an empty body");
+  check(validateProfileBody("name,CRLF\r\npoint,0,3\r\npoint,9,6\r\n"), "accepts CRLF line endings");
+
   std::printf("\n%s\n", failures ? "FAILURES" : "all checks passed");
   return failures != 0;
 }
