@@ -13,6 +13,8 @@ This mod is a fork of [marax-pressure-mod](https://github.com/larszi/marax-press
 - Different pressure sensor is used, so no resistors are needed
 - OTA updates are possible
 - Implemented on a ESP32 S3 instead of an Arduino
+- Pressure profiles are polylines rather than four fixed steps: each point anchors a pressure at a time, and reaches it either by ramping linearly from the previous point or by jumping to it, so a profile can hold a pressure, step straight to another, and then ramp away. See [the profile docs](doc/profiles/profiles.md).
+- Home Assistant integration over MQTT with auto-discovery, including editing the SD-card profiles by dragging the curve in a custom Lovelace card. See [the Home Assistant docs](doc/homeassistant/homeassistant.md).
 
 ### Similar projects
 

@@ -1,0 +1,217 @@
+# Mara X dashboard
+# https://github.com/laurentflorin/marax-pressure-mod
+#
+# Paste the whole file into a dashboard's raw configuration editor:
+#   Settings → Dashboards → (your dashboard) → ⋮ → Edit → ⋮ → Raw configuration editor
+#
+# The profile view needs marax-profile-card.js registered as a resource first —
+# see doc/homeassistant/homeassistant.md. Everything else uses built-in cards
+# only, so the rest of the dashboard still works if that card is missing.
+#
+# Entity IDs assume Home Assistant slugged the device as `mara_x`. Check under
+# Developer Tools → States with the filter `mara_x`; if yours differ (a repeated
+# discovery can leave a `_2` suffix behind), search and replace them here.
+
+title: Mara X
+
+views:
+  # ────────────────────────────────────────────────────────────────────────
+  - title: Machine
+    path: machine
+    icon: mdi:coffee-maker
+    cards:
+      # The controller sets a retained "offline" through its MQTT last will, so
+      # every entity goes unavailable together when the ESP32 drops off. Worth
+      # saying plainly rather than showing a wall of dashes.
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.mara_x_power
+            state: unavailable
+        card:
+          type: markdown
+          content: |-
+            ## ⚠️ Controller offline
+
+            The ESP32 is not connected to MQTT. Readings below are stale.
+
+      # Machine off, controller fine: the temperature entities are power-gated
+      # so they go unavailable rather than reporting a misleading 0 °C.
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.mara_x_power
+            state: "off"
+        card:
+          type: markdown
+          content: |-
+            ### Machine is switched off
+
+            Temperatures resume within a few seconds of powering it on.
+
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.mara_x_power
+            state: "on"
+        card:
+          type: horizontal-stack
+          cards:
+            - type: gauge
+              entity: sensor.mara_x_brew_temperature
+              name: Brew
+              unit: °C
+              min: 20
+              max: 110
+              needle: true
+              segments:
+                - from: 20
+                  color: "#3f8fd0"
+                - from: 88
+                  color: "#43a047"
+                - from: 97
+                  color: "#f0a30a"
+                - from: 103
+                  color: "#db4437"
+            - type: gauge
+              entity: sensor.mara_x_steam_temperature
+              name: Steam
+              unit: °C
+              min: 20
+              max: 145
+              needle: true
+              segments:
+                - from: 20
+                  color: "#3f8fd0"
+                - from: 115
+                  color: "#43a047"
+                - from: 132
+                  color: "#f0a30a"
+                - from: 140
+                  color: "#db4437"
+
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: tile
+            entity: binary_sensor.mara_x_power
+            name: Machine
+            icon: mdi:power
+          - type: tile
+            entity: binary_sensor.mara_x_heating_element
+            name: Heating
+            icon: mdi:heating-coil
+          - type: tile
+            entity: sensor.mara_x_steam_target_temperature
+            name: Steam target
+            icon: mdi:target
+          - type: tile
+            entity: sensor.mara_x_shot_count
+            name: Shots
+            icon: mdi:coffee
+
+      # Fast heat only means anything while it is counting down.
+      - type: conditional
+        conditions:
+          - entity: sensor.mara_x_fast_heat_countdown
+            state_not: "0"
+          - entity: sensor.mara_x_fast_heat_countdown
+            state_not: unavailable
+          - entity: sensor.mara_x_fast_heat_countdown
+            state_not: unknown
+        card:
+          type: tile
+          entity: sensor.mara_x_fast_heat_countdown
+          name: Fast heat remaining
+          icon: mdi:fire
+
+      - type: history-graph
+        title: Temperatures
+        hours_to_show: 3
+        entities:
+          - entity: sensor.mara_x_brew_temperature
+            name: Brew
+          - entity: sensor.mara_x_steam_temperature
+            name: Steam
+          - entity: binary_sensor.mara_x_heating_element
+            name: Heating
+
+  # ────────────────────────────────────────────────────────────────────────
+  - title: Profile
+    path: profile
+    icon: mdi:chart-bell-curve-cumulative
+    cards:
+      # Works whether or not the custom card loaded, so the machine can always
+      # be pointed at a different profile from here.
+      - type: tile
+        entity: select.mara_x_profile
+        name: Active profile
+        icon: mdi:playlist-play
+        features:
+          - type: select-options
+
+      - type: custom:marax-profile-card
+        title: Pressure profile
+        # prefix: marax   # only if you changed the MQTT topic prefix
+
+      # Every save, select and delete is answered here.
+      - type: conditional
+        conditions:
+          - entity: sensor.mara_x_profile_command_result
+            state_not: unknown
+          - entity: sensor.mara_x_profile_command_result
+            state_not: unavailable
+        card:
+          type: tile
+          entity: sensor.mara_x_profile_command_result
+          name: Last profile command
+          icon: mdi:message-alert-outline
+
+      - type: markdown
+        content: |-
+          Drag a point to move it, tap an empty part of the graph to add one.
+          A **filled** handle jumps — it holds the previous pressure and steps
+          at its own time; an **outlined** handle ramps in from the point
+          before it. The first point is pinned to the start of the shot.
+
+
+          Edits are refused while a shot is running.
+
+  # ────────────────────────────────────────────────────────────────────────
+  - title: Diagnostics
+    path: diagnostics
+    icon: mdi:wrench
+    cards:
+      - type: entities
+        title: Controller
+        entities:
+          - entity: binary_sensor.mara_x_power
+            name: Power state
+          - entity: sensor.mara_x_serial_frame
+            name: Raw GiCar frame
+          - entity: sensor.mara_x_profile_command_result
+            name: Last profile command
+          - entity: select.mara_x_profile
+            name: Active profile
+
+      - type: entities
+        title: Readings
+        entities:
+          - entity: sensor.mara_x_brew_temperature
+          - entity: sensor.mara_x_steam_temperature
+          - entity: sensor.mara_x_steam_target_temperature
+          - entity: sensor.mara_x_fast_heat_countdown
+          - entity: sensor.mara_x_shot_count
+          - entity: binary_sensor.mara_x_heating_element
+
+      - type: markdown
+        title: MQTT topics
+        content: |-
+          | Topic | Meaning |
+          | --- | --- |
+          | `marax/status` | `online` / `offline`, the controller's last will |
+          | `marax/profile/list` | Profiles on the SD card |
+          | `marax/profile/name` | Loaded profile's file name |
+          | `marax/profile/active` | Loaded profile as v2 CSV |
+          | `marax/profile/result` | Answer to the last command |
+          | `marax/profile/select` | Send a file name to load it |
+          | `marax/profile/save/<name>` | Send a v2 CSV to write it |
+          | `marax/profile/delete/<name>` | Send anything to delete it |
