@@ -239,33 +239,6 @@ void writeSetBarValue(int wave);
 
 PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
 
-// MQTT commands are recorded by the callback and carried out later from the
-// main loop. The callback runs inside mqttClient.loop(); writing to the SD card
-// or publishing from in there would re-enter the client and stall the loop at
-// an arbitrary moment — including in the middle of a shot.
-enum ProfileCommandKind
-{
-  PROFILE_CMD_NONE = 0,
-  PROFILE_CMD_SELECT,
-  PROFILE_CMD_SAVE,
-  PROFILE_CMD_DELETE,
-  PROFILE_CMD_TOO_LARGE  // recorded so the sender gets an answer either way
-};
-
-struct PendingProfileCommand
-{
-  ProfileCommandKind kind;
-  char stem[PROFILE_NAME_MAX_LEN];
-  char body[PROFILE_BODY_MAX_LEN];
-  unsigned int bodyLength;
-};
-
-PendingProfileCommand pendingProfileCommand = { PROFILE_CMD_NONE, "", "", 0 };
-// Set whenever the profile list or the active profile changes, so the retained
-// topics are refreshed from the main loop rather than from wherever the change
-// happened to occur.
-bool profileStateDirty = true;
-
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu CONSTS
 // nunununununununununununununununununununununununununununununun
@@ -426,6 +399,35 @@ float targetWeight = 36.0f;
 bool sdReady = false;
 char persistedProfileFile[PROFILE_NAME_MAX_LEN] = "";
 Preferences preferences;
+
+// Kept here rather than up with the other MQTT globals because the struct
+// sizes its members with PROFILE_NAME_MAX_LEN, defined just above.
+// MQTT commands are recorded by the callback and carried out later from the
+// main loop. The callback runs inside mqttClient.loop(); writing to the SD card
+// or publishing from in there would re-enter the client and stall the loop at
+// an arbitrary moment — including in the middle of a shot.
+enum ProfileCommandKind
+{
+  PROFILE_CMD_NONE = 0,
+  PROFILE_CMD_SELECT,
+  PROFILE_CMD_SAVE,
+  PROFILE_CMD_DELETE,
+  PROFILE_CMD_TOO_LARGE  // recorded so the sender gets an answer either way
+};
+
+struct PendingProfileCommand
+{
+  ProfileCommandKind kind;
+  char stem[PROFILE_NAME_MAX_LEN];
+  char body[PROFILE_BODY_MAX_LEN];
+  unsigned int bodyLength;
+};
+
+PendingProfileCommand pendingProfileCommand = { PROFILE_CMD_NONE, "", "", 0 };
+// Set whenever the profile list or the active profile changes, so the retained
+// topics are refreshed from the main loop rather than from wherever the change
+// happened to occur.
+bool profileStateDirty = true;
 
 // Touch events arriving on UART2 are queued by nextionProcessRx() instead of
 // being acted on where they are parsed, so a `get` reply can never swallow one.

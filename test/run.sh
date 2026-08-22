@@ -4,12 +4,13 @@
 # plain computation, and the test code is lifted straight out of the sketch so
 # it cannot drift from what actually gets flashed.
 #
-# Needs python3, a C++ compiler, and node (for the card test).
+# Needs python3, a C++ compiler, and node (for the card test). The compile
+# suite also needs the ESP32 toolchain, and skips itself if it is not there.
 #
 #   sh test/run.sh
 set -e
 cd "$(dirname "$0")/.."
-for suite in profile_core mqtt_discovery card; do
+for suite in profile_core mqtt_discovery card compile; do
   echo "── $suite ─────────────────────────────────────────────"
   sh "test/$suite/run.sh"
   echo
