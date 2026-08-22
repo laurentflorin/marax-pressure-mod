@@ -132,15 +132,44 @@ data:
 `homeassistant/marax-profile-card.js` in this repository is a self-contained
 Lovelace card — no HACS, no build step, no external dependencies.
 
-1. Copy it to `<config>/www/marax-profile-card.js`.
-2. **Settings → Dashboards → ⋮ → Resources → Add resource**, URL
-   `/local/marax-profile-card.js`, type **JavaScript module**.
-3. Add it to a dashboard:
+**1. Find the config directory.** In a Docker install it is the host folder
+mapped to `/config`:
 
-   ```yaml
-   type: custom:marax-profile-card
-   # prefix: marax    # only if you changed the MQTT topic prefix
-   ```
+```sh
+docker inspect homeassistant --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+```
+
+**2. Copy the card into `<config>/www/`.** That folder does not exist in a
+fresh install — create it. Home Assistant serves it at `/local/`:
+
+```sh
+scp homeassistant/marax-profile-card.js you@homeassistant:/your/config/www/
+```
+
+**3. Restart Home Assistant** if you just created `www/`. The `/local/` route is
+registered at startup, so until then the file returns 404 — this is the usual
+reason a freshly installed card does not appear. Files dropped into an existing
+`www/` need no restart.
+
+**4. Register it.** **Settings → Dashboards → ⋮ → Resources → + Add resource**,
+URL `/local/marax-profile-card.js`, type **JavaScript module**. If the menu has
+no Resources entry, enable **Advanced Mode** in your user profile — it is
+hidden otherwise.
+
+**5. Hard-refresh the browser** (Ctrl+Shift+R). The card is cached aggressively.
+When you update it later, bump a version in the resource URL
+(`/local/marax-profile-card.js?v=2`), or browsers keep serving the old copy.
+
+Then add it to a dashboard:
+
+```yaml
+type: custom:marax-profile-card
+# prefix: marax    # only if you changed the MQTT topic prefix
+```
+
+To check where a failure is: open `http://<home-assistant>:8123/local/marax-profile-card.js`
+in a browser. A 404 means step 2 or 3. If it loads but the dashboard says
+*"Custom element doesn't exist: marax-profile-card"*, it is step 4 or 5.
 
 Drag a point to move it, tap an empty part of the graph to add one, and use the
 row below the graph to type exact values, switch a point between ramp and jump,
