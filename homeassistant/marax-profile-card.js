@@ -17,6 +17,8 @@
  * Install: copy to <config>/www/marax-profile-card.js, then add it under
  * Settings → Dashboards → Resources as /local/marax-profile-card.js
  * (JavaScript module).
+ *
+ * dashboard.yaml alongside this file is a ready-made dashboard that uses it.
  */
 
 const MAX_BAR = 12;

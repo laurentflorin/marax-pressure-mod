@@ -152,6 +152,31 @@ The card reads MQTT through Home Assistant's websocket API, which is
 **available to admin users only** — a non-admin will see a subscribe error
 instead of the curve.
 
+## A ready-made dashboard
+
+`homeassistant/dashboard.yaml` in this repository is a complete three-view
+dashboard. Paste it into **Settings → Dashboards → *your dashboard* → ⋮ Edit →
+⋮ Raw configuration editor**, replacing what is there.
+
+| View | What it holds |
+| --- | --- |
+| Machine | Brew and steam gauges, power and heating tiles, shot count, a fast-heat countdown that appears only while it is running, and a three-hour temperature graph |
+| Profile | The curve editor, a profile picker that works even if the custom card fails to load, and the result of the last profile command |
+| Diagnostics | Every entity in plain rows, plus a reference table of the MQTT topics |
+
+The Machine view leads with two conditional banners, because "no reading" has
+two quite different causes here: the controller being offline (everything
+unavailable, via the MQTT last will) and the machine simply being switched off
+(temperatures unavailable by design, so they cannot drag the history graph down
+to 0 °C). Only the Profile view needs the custom card; everything else is
+built-in cards.
+
+The entity IDs assume Home Assistant slugged the device as `mara_x` — for
+example `sensor.mara_x_brew_temperature`. Check yours under **Developer Tools →
+States** with the filter `mara_x`. A repeated discovery can leave a `_2` suffix
+behind; if that happened, delete the stale entity or search and replace the IDs
+in the YAML.
+
 ## Troubleshooting
 
 Watch what the controller actually sends:
