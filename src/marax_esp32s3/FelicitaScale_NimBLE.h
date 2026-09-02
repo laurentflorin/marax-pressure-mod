@@ -18,6 +18,10 @@
  *   [11-14] unknown
  *   [15]   battery (129=min, 158=max)
  *   [16-17] CR LF
+ *
+ * Connecting never blocks: every attempt is started here and finished by
+ * pollConnect() from the main loop, which also runs pressure profiling and
+ * the boiler control and must not stall for seconds on a scale that is off.
  */
 
 #ifndef FELICITASCALE_NIMBLE_H
@@ -39,25 +43,62 @@
 
 class FelicitaScale_NimBLE {
 private:
+    // What the non-blocking connect state machine is currently doing.
+    enum ConnectState : uint8_t {
+        CONN_IDLE,        // nothing in flight
+        CONN_SCANNING,    // background scan looking for the scale
+        CONN_CONNECTING   // async connect in flight, waiting for the result
+    };
+
+    // Runs in the NimBLE host task, so it only ever sets a flag.
+    class ClientCallbacks : public NimBLEClientCallbacks {
+    public:
+        explicit ClientCallbacks(FelicitaScale_NimBLE *owner) : owner(owner) {}
+        void onConnectFail(NimBLEClient *client, int reason) override {
+            (void)client;
+            (void)reason;
+            owner->connectFailed = true;
+        }
+    private:
+        FelicitaScale_NimBLE *owner;
+    };
+
     NimBLEClient *pClient = nullptr;
     NimBLERemoteCharacteristic *pWriteChar = nullptr;
     NimBLERemoteCharacteristic *pNotifyChar = nullptr;
     NimBLEScan *pScan = nullptr;
-    
+    ClientCallbacks clientCallbacks;
+
     String targetMAC;
     bool debug;
     bool connected = false;
     bool weightDataAvailable = false;
-    bool scanInProgress = false;
-    
+
+    ConnectState connectState = CONN_IDLE;
+    volatile bool connectFailed = false;
+    unsigned long connectStartedMs = 0;
+
+    // Address of the scale we last talked to. Reconnecting straight to it is
+    // far more reliable than re-discovering it: the controller then latches on
+    // to the very first advertisement the scale sends after being switched on,
+    // instead of us having to be mid-scan at that exact moment.
+    NimBLEAddress knownAddress{};  // value-initialised so isNull() is true until we connect
+    uint8_t directConnectFailures = 0;
+
     float currentWeight = 0.0f;
     float battery = 0.0f;
-    unsigned long lastHeartbeat = 0;
     unsigned long lastWeightUpdate = 0;
-    
-    static const uint32_t HEARTBEAT_INTERVAL_MS = 2000;  // Felicita doesn't need heartbeats but we use this to detect stale connection
+
     static const uint32_t SCAN_DURATION_MS = 5000;
-    
+    static const uint32_t CONNECT_TIMEOUT_MS = 8000;
+    static const uint32_t CONNECT_GIVEUP_MS = CONNECT_TIMEOUT_MS + 3000;
+    // After this many direct attempts fall back to scanning: the scale may have
+    // come back with a different address.
+    static const uint8_t MAX_DIRECT_CONNECT_FAILURES = 3;
+    // The Felicita streams ~10 packets a second while it is on, so silence this
+    // long means the link is dead even if the controller has not noticed yet.
+    static const uint32_t DATA_STALE_MS = 15000;
+
     // Store instance pointer for callback access
     static FelicitaScale_NimBLE *callbackInstance;
     
@@ -97,7 +138,6 @@ private:
         currentWeight = weight;
         weightDataAvailable = true;
         lastWeightUpdate = millis();
-        lastHeartbeat = millis();  // Reset heartbeat timer on any packet
         
         // Battery: byte 15, range 129-158
         if (length > 15) {
@@ -167,90 +207,136 @@ private:
                deviceName.indexOf("PYXIS") >= 0;
     }
 
-public:
-    FelicitaScale_NimBLE(bool enableDebug = false) : debug(enableDebug) {
-        callbackInstance = this;  // Set static instance pointer for callbacks
-    }
-    
-    ~FelicitaScale_NimBLE() {
+    // Hand the client back to NimBLE. deleteClient() disconnects or cancels a
+    // pending connect for us, so this is safe in every state.
+    void releaseClient() {
         if (pClient) {
-            disconnect();
+            NimBLEDevice::deleteClient(pClient);
+            pClient = nullptr;
         }
-        if (callbackInstance == this) {
-            callbackInstance = nullptr;
-        }
+        pWriteChar = nullptr;
+        pNotifyChar = nullptr;
     }
-    
-    // Start a background connection attempt.
-    // macAddress: BLE MAC address (e.g. "B0:10:A0:8E:81:67") or empty string for auto-discovery
-    bool beginConnect(const char *macAddress = "") {
-        targetMAC = String(macAddress);
 
-        if (isConnected()) {
-            connected = true;
-            return true;
+    // Kick off a non-blocking connect to a known address.
+    bool startConnect(const NimBLEAddress &address) {
+        if (pScan && pScan->isScanning()) {
+            pScan->stop();
+        }
+        releaseClient();
+
+        pClient = NimBLEDevice::createClient();
+        if (!pClient) {
+            if (debug) Serial.println("[SCALE] ERROR: no free BLE client slot");
+            return false;
         }
 
-        if (connected) {
-            disconnect();
+        pClient->setClientCallbacks(&clientCallbacks, false);
+        pClient->setConnectTimeout(CONNECT_TIMEOUT_MS);
+        // We drive the retries ourselves so a failed attempt reports back
+        // promptly instead of occupying the radio for three timeouts.
+        pClient->setConnectRetries(0);
+        // NimBLE's default connection parameters, except for the last two: the
+        // initiator listens 30ms out of every 60ms rather than continuously,
+        // which leaves radio time for WiFi on the ESP32-S3's single 2.4GHz radio.
+        pClient->setConnectionParams(BLE_GAP_INITIAL_CONN_ITVL_MIN,
+                                     BLE_GAP_INITIAL_CONN_ITVL_MAX,
+                                     BLE_GAP_INITIAL_CONN_LATENCY,
+                                     BLE_GAP_INITIAL_SUPERVISION_TIMEOUT,
+                                     96, 48);
+
+        connectFailed = false;
+        connectStartedMs = millis();
+
+        if (!pClient->connect(address, true, true)) {  // deleteAttributes, async
+            if (debug) Serial.println("[SCALE] Failed to start connect");
+            releaseClient();
+            return false;
         }
 
-        if (debug) {
-            Serial.println("[SCALE] Initializing NimBLE...");
-            if (targetMAC.length() > 0) {
-                Serial.print("[SCALE] Scanning for MAC: ");
-                Serial.println(targetMAC);
-            } else {
-                Serial.println("[SCALE] Auto-discovering Felicita/Acaia scale...");
+        connectState = CONN_CONNECTING;
+        return true;
+    }
+
+    // Link is up: find the Felicita characteristic and subscribe to it.
+    bool finishConnect() {
+        if (debug) Serial.println("[SCALE] Connected, discovering services...");
+
+        // Felicita Arc uses service 0xFFE0, characteristic 0xFFE1 (write + notify)
+        NimBLERemoteService *pService = pClient->getService(FELICITA_SERVICE_UUID);
+        if (!pService) {
+            if (debug) {
+                // Log actual services for debugging
+                const std::vector<NimBLERemoteService*> &services = pClient->getServices(true);
+                Serial.print("[SCALE] Service 0xFFE0 not found. Found ");
+                Serial.print(services.size());
+                Serial.println(" services:");
+                for (NimBLERemoteService *svc : services) {
+                    Serial.print("[SCALE]   ");
+                    Serial.println(svc->getUUID().toString().c_str());
+                }
             }
-        }
-
-        if (!ensureBleReady()) {
+            disconnect();
             return false;
         }
 
-        if (pScan->isScanning()) {
-            scanInProgress = true;
+        // Get the single FFE1 characteristic (used for both write and notify)
+        pWriteChar = pService->getCharacteristic(FELICITA_CHAR_UUID);
+        if (!pWriteChar) {
+            if (debug) Serial.println("[SCALE] Characteristic 0xFFE1 not found");
+            disconnect();
+            return false;
+        }
+        pNotifyChar = pWriteChar;  // Same characteristic for notifications
+
+        if (debug) Serial.println("[SCALE] Found Felicita service/characteristic");
+
+        // Subscribe to notifications
+        if (pNotifyChar->canNotify()) {
+            pNotifyChar->subscribe(true, notifyCallback);
+        }
+
+        knownAddress = pClient->getPeerAddress();
+        directConnectFailures = 0;
+        connected = true;
+        lastWeightUpdate = millis();
+
+        // Felicita doesn't need initialization commands - it streams weight automatically
+        // after subscribing to notifications
+
+        if (debug) Serial.println("[SCALE] Ready! Receiving weight notifications.");
+        return true;
+    }
+
+    bool pollConnecting() {
+        if (pClient && pClient->isConnected()) {
+            connectState = CONN_IDLE;
+            if (finishConnect()) {
+                return true;
+            }
+            // Linked up but not usable (wrong device, or discovery failed):
+            // count it so we fall back to scanning instead of retrying forever.
+            if (directConnectFailures < 255) directConnectFailures++;
             return false;
         }
 
-        pScan->clearResults();
-
-        if (debug) {
-            Serial.print("[SCALE] Starting ");
-            Serial.print(SCAN_DURATION_MS);
-            Serial.println("ms BLE scan in background...");
+        if (connectFailed || (millis() - connectStartedMs) > CONNECT_GIVEUP_MS) {
+            if (debug) Serial.println("[SCALE] Connect attempt failed");
+            connectState = CONN_IDLE;
+            if (directConnectFailures < 255) directConnectFailures++;
+            releaseClient();
+            connected = false;
         }
 
-        if (!pScan->start(SCAN_DURATION_MS, false, true)) {
-            if (debug) Serial.println("[SCALE] ERROR: Failed to start BLE scan");
-            scanInProgress = false;
-            return false;
-        }
-
-        scanInProgress = true;
         return false;
     }
 
-    bool init(const char *macAddress = "") {
-        return beginConnect(macAddress);
-    }
-
-    bool pollConnect() {
-        if (isConnected()) {
-            connected = true;
-            return true;
-        }
-
-        if (!scanInProgress || !pScan) {
+    bool pollScan() {
+        if (!pScan || pScan->isScanning()) {
             return false;
         }
 
-        if (pScan->isScanning()) {
-            return false;
-        }
-
-        scanInProgress = false;
+        connectState = CONN_IDLE;
         NimBLEScanResults results = pScan->getResults();
 
         if (debug) {
@@ -296,9 +382,12 @@ public:
                 Serial.println(")");
             }
 
-            bool connectedNow = connectToScale(device);
+            // Copy the address before clearing the results: the device objects
+            // are deleted by clearResults().
+            NimBLEAddress address = device->getAddress();
             pScan->clearResults();
-            return connectedNow;
+            startConnect(address);
+            return false;  // the connect finishes in pollConnecting()
         }
 
         pScan->clearResults();
@@ -308,8 +397,109 @@ public:
         return false;
     }
 
+public:
+    FelicitaScale_NimBLE(bool enableDebug = false) : clientCallbacks(this), debug(enableDebug) {
+        callbackInstance = this;  // Set static instance pointer for callbacks
+    }
+    
+    ~FelicitaScale_NimBLE() {
+        disconnect();
+        if (callbackInstance == this) {
+            callbackInstance = nullptr;
+        }
+    }
+    
+    // Start a background connection attempt.
+    // macAddress: BLE MAC address (e.g. "B0:10:A0:8E:81:67") or empty string for auto-discovery
+    bool beginConnect(const char *macAddress = "") {
+        targetMAC = String(macAddress);
+
+        if (isConnected()) {
+            connected = true;
+            return true;
+        }
+
+        if (connected) {
+            disconnect();
+        }
+
+        if (connectState != CONN_IDLE) {
+            return false;  // an attempt is already running
+        }
+
+        if (!ensureBleReady()) {
+            return false;
+        }
+
+        // Fast path: go straight back to the scale we know, no scan needed.
+        if (!knownAddress.isNull() && directConnectFailures < MAX_DIRECT_CONNECT_FAILURES) {
+            if (debug) {
+                Serial.print("[SCALE] Reconnecting directly to ");
+                Serial.println(knownAddress.toString().c_str());
+            }
+            if (startConnect(knownAddress)) {
+                return false;
+            }
+        }
+
+        if (debug) {
+            if (targetMAC.length() > 0) {
+                Serial.print("[SCALE] Scanning for MAC: ");
+                Serial.println(targetMAC);
+            } else {
+                Serial.println("[SCALE] Auto-discovering Felicita/Acaia scale...");
+            }
+        }
+
+        if (pScan->isScanning()) {
+            connectState = CONN_SCANNING;
+            return false;
+        }
+
+        pScan->clearResults();
+
+        if (debug) {
+            Serial.print("[SCALE] Starting ");
+            Serial.print(SCAN_DURATION_MS);
+            Serial.println("ms BLE scan in background...");
+        }
+
+        if (!pScan->start(SCAN_DURATION_MS, false, true)) {
+            if (debug) Serial.println("[SCALE] ERROR: Failed to start BLE scan");
+            return false;
+        }
+
+        // Alternate: after a scan the address we hold is either confirmed or
+        // replaced, so let the next attempt use the fast direct path again.
+        directConnectFailures = 0;
+        connectState = CONN_SCANNING;
+        return false;
+    }
+
+    bool init(const char *macAddress = "") {
+        return beginConnect(macAddress);
+    }
+
+    // Advance the connection attempt. Returns true on the loop where the scale
+    // became usable.
+    bool pollConnect() {
+        if (isConnected()) {
+            connected = true;
+            return true;
+        }
+
+        switch (connectState) {
+            case CONN_CONNECTING:
+                return pollConnecting();
+            case CONN_SCANNING:
+                return pollScan();
+            default:
+                return false;
+        }
+    }
+
     bool isConnectionAttemptInProgress() {
-        return scanInProgress || (pScan && pScan->isScanning());
+        return connectState != CONN_IDLE || (pScan && pScan->isScanning());
     }
 
     void cancelPendingConnect() {
@@ -319,96 +509,30 @@ public:
         if (pScan) {
             pScan->clearResults();
         }
-        scanInProgress = false;
-    }
-    
-    // Connect to discovered scale
-    bool connectToScale(const NimBLEAdvertisedDevice *device) {
-        if (pClient) {
-            disconnect();
+        if (connectState == CONN_CONNECTING) {
+            releaseClient();
+            connected = false;
         }
-
-        pClient = NimBLEDevice::createClient();
-        if (!pClient->connect(device)) {
-            if (debug) Serial.println("[SCALE] Connection failed");
-            disconnect();
-            return false;
-        }
-        
-        if (debug) Serial.println("[SCALE] Connected, discovering services...");
-        
-        // Felicita Arc uses service 0xFFE0, characteristic 0xFFE1 (write + notify)
-        NimBLERemoteService *pService = pClient->getService(FELICITA_SERVICE_UUID);
-        if (!pService) {
-            if (debug) {
-                // Log actual services for debugging
-                const std::vector<NimBLERemoteService*> &services = pClient->getServices(true);
-                Serial.print("[SCALE] Service 0xFFE0 not found. Found ");
-                Serial.print(services.size());
-                Serial.println(" services:");
-                for (NimBLERemoteService *svc : services) {
-                    Serial.print("[SCALE]   ");
-                    Serial.println(svc->getUUID().toString().c_str());
-                }
-            }
-            disconnect();
-            return false;
-        }
-        
-        // Get the single FFE1 characteristic (used for both write and notify)
-        pWriteChar = pService->getCharacteristic(FELICITA_CHAR_UUID);
-        if (!pWriteChar) {
-            if (debug) Serial.println("[SCALE] Characteristic 0xFFE1 not found");
-            disconnect();
-            return false;
-        }
-        pNotifyChar = pWriteChar;  // Same characteristic for notifications
-        
-        if (debug) Serial.println("[SCALE] Found Felicita service/characteristic");
-        
-        // Subscribe to notifications
-        if (pNotifyChar->canNotify()) {
-            pNotifyChar->subscribe(true, notifyCallback);
-        }
-        
-        connected = true;
-        lastHeartbeat = millis();
-        
-        // Felicita doesn't need initialization commands - it streams weight automatically
-        // after subscribing to notifications
-        
-        if (debug) Serial.println("[SCALE] Ready! Receiving weight notifications.");
-        return true;
+        connectState = CONN_IDLE;
     }
     
     // Disconnect from scale
     void disconnect() {
-        if (pClient) {
-            pClient->disconnect();
-            NimBLEDevice::deleteClient(pClient);  // Don't use delete directly - NimBLE manages clients
-            pClient = nullptr;
-        }
-        pWriteChar = nullptr;
-        pNotifyChar = nullptr;
+        releaseClient();
         connected = false;
+        connectState = CONN_IDLE;
     }
     
     // Check if connected
     bool isConnected() {
         return connected && pClient && pClient->isConnected();
     }
-    
-    // heartbeat: Felicita streams data automatically, no keepalive needed.
-    // We use lastHeartbeat as a staleness check - if no packet in 5s, connection is dead.
-    bool heartbeatRequired() {
-        return (millis() - lastHeartbeat) > 5000;  // 5s without data = dead
-    }
-    
-    void heartbeat() {
-        // No-op for Felicita - just reset the timer to prevent false disconnects
-        // (called by updateScale() when heartbeatRequired() is true, which means
-        //  we actually haven't received data - this indicates a real disconnect)
-        lastHeartbeat = millis();
+
+    // True when the link still looks up but the scale stopped streaming, which
+    // is how a scale that was switched off can look until the controller times
+    // the connection out. Treat it as a disconnect and reconnect.
+    bool linkIsStale() {
+        return connected && (millis() - lastWeightUpdate) > DATA_STALE_MS;
     }
     
     // Check if new weight data is available

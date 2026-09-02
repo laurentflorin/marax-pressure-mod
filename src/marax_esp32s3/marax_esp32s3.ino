@@ -116,6 +116,9 @@
 #define wifi_password ""
 // Scale MAC address - empty string enables auto-discovery of any Felicita scale
 #define SCALE_MAC_ADDRESS ""
+// Set to true to log BLE scanning/connecting on the serial monitor. Useful when
+// the scale will not (re)connect.
+#define SCALE_BLE_DEBUG false
 
 WiFiClient wifiClient;
 bool wifiConnected = false;
@@ -441,14 +444,21 @@ NextionTouchEvent nextionTouchQueue[NEXTION_TOUCH_QUEUE_LEN];
 uint8_t nextionTouchQueueHead = 0;
 uint8_t nextionTouchQueueCount = 0;
 
-FelicitaScale_NimBLE scale(false);  // true = enable debug to see BLE scan results
+FelicitaScale_NimBLE scale(SCALE_BLE_DEBUG);  // see SCALE_BLE_DEBUG above
 float currentWeight = 0.0f;
 float prevWeight = 0.0f;
 unsigned long lastWeightTime = 0;
 float flowRate = 0.0f;
 int lastScaleConnectedUi = -1; // -1 forces first UI update
+unsigned long lastScaleConnectedUiWriteMs = 0;
 unsigned long lastScaleReconnectAttemptMs = 0;
-const unsigned long SCALE_RECONNECT_INTERVAL_MS = 30000;  // 30 seconds between scan attempts
+// Idle gap between two non-blocking connection attempts (an attempt itself
+// occupies the radio for up to ~8s). Short enough that the scale is picked up
+// within seconds of being switched back on, long enough to leave WiFi air time.
+const unsigned long SCALE_RECONNECT_INTERVAL_MS = 5000;
+// The icon write is re-sent this often even when nothing changed, because a
+// cross-page write fails silently while the home page is not loaded.
+const unsigned long SCALE_UI_REFRESH_INTERVAL_MS = 5000;
 
 bool pendingObservation = false;
 unsigned long pendingObsTime = 0;
@@ -1859,23 +1869,34 @@ void updateProfileModeText()
 void updateScaleConnectionUi()
 {
   int connected = scaleConnected ? 1 : 0;
-  
-  if (connected != lastScaleConnectedUi)
+  bool changed = (connected != lastScaleConnectedUi);
+  unsigned long now = millis();
+
+  // Re-send periodically as well as on change: the write below is lost whenever
+  // the home page is not the loaded page, so a state change that happens on the
+  // brew or settings page would otherwise leave the icon stale forever.
+  if (!changed && (now - lastScaleConnectedUiWriteMs) < SCALE_UI_REFRESH_INTERVAL_MS)
   {
-    Serial.print("[DEBUG] Scale connection changed: "); 
+    return;
+  }
+
+  if (changed)
+  {
+    Serial.print("[DEBUG] Scale connection changed: ");
     Serial.print(lastScaleConnectedUi);
     Serial.print(" -> ");
     Serial.println(connected);
-
-    // Update global variable (used by home page timer to refresh scalecon.val)
-    myNex.writeNum("scaleConnected", connected);
-    // Directly update p3.pic on home page (pic 20=connected, 21=disconnected).
-    // The cross-page write fails when the home page is not loaded; with bkcmd=0
-    // (set in setup()) that failure is silent instead of returning a junk packet.
-    myNex.writeNum("home.p3.pic", connected ? 20 : 21);
-
-    lastScaleConnectedUi = connected;
   }
+
+  // Update global variable (used by home page timer to refresh scalecon.val)
+  myNex.writeNum("scaleConnected", connected);
+  // Directly update p3.pic on home page (pic 20=connected, 21=disconnected).
+  // The cross-page write fails when the home page is not loaded; with bkcmd=0
+  // (set in setup()) that failure is silent instead of returning a junk packet.
+  myNex.writeNum("home.p3.pic", connected ? 20 : 21);
+
+  lastScaleConnectedUi = connected;
+  lastScaleConnectedUiWriteMs = now;
 }
 
 void tryReconnectScale()
@@ -1897,6 +1918,9 @@ void tryReconnectScale()
 
   if (scale.isConnectionAttemptInProgress())
   {
+    // Time the gap from the end of an attempt, not its start, so back-to-back
+    // attempts don't keep the shared 2.4GHz radio busy the whole time.
+    lastScaleReconnectAttemptMs = millis();
     return;
   }
 
@@ -2592,18 +2616,18 @@ void updateScale()
     return;
   }
 
-  if (!scale.isConnected())
+  // A scale that was switched off can keep looking connected until the link
+  // supervision times out, so treat a stream that went quiet as a dead link too.
+  if (!scale.isConnected() || scale.linkIsStale())
   {
+    Serial.println(scale.isConnected() ? "[DEBUG] Scale stopped sending data — dropping the link"
+                                       : "[DEBUG] Scale disconnected");
     scale.disconnect();
     scaleConnected = false;
     flowRate = 0.0f;
+    lastScaleReconnectAttemptMs = 0;  // reconnect on the next loop, don't wait out the interval
     updateScaleConnectionUi();
     return;
-  }
-
-  if (scale.heartbeatRequired())
-  {
-    scale.heartbeat();
   }
 
   if (scale.newWeightAvailable())
