@@ -35,6 +35,18 @@ The dimmer is wired between the Gicar and the Pump. I use some hot glue to make 
 
 ![Dimmer](/assets/dimmer.jpg)
 
+### Idle boiler fill
+
+Because the dimmer sits downstream of the GiCar's pump relay, the GiCar cannot
+fill the boiler through a closed dimmer, and nothing tells it why the pump did
+not run. `updateIdlePumpControl()` therefore only cuts the pump when the reading
+is genuinely a full boiler: above 1 bar cold or 5 bar once steam is over 80 °C,
+held for 400 ms, on a filter that has had a second to settle after being seeded.
+Even then the cut is released after 45 s if the pressure no longer backs it up.
+
+If the boiler ever fails to fill on start-up, the serial log says so directly —
+look for a `[FILL]` line next to the `[DIMMER] 255 → 0` that cut the pump.
+
 ## Brew Switch and Relay
 
 ![Brewswitch](/assets/brew_switch.jpg)

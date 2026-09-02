@@ -489,15 +489,49 @@ float sensorVal;
 //   1–254 → delay = map(brightness, 0, 255, 10000µs, 100µs)
 //            i.e. brightness=128 → ~5050µs delay → ~50% power
 //
-// Idle pressure threshold above which the boiler is considered full.
-// It switches dynamically: 5.0 bar when steam is hot (>80°C), otherwise 0.5 bar.
-float boilerFullPressureBar = 0.5f;
+// The cold threshold used to be 0.5 bar, which is not enough to tell "boiler
+// full" apart from ordinary brew-line pressure: residual pressure left over
+// from the last shot and the thermal expansion of a heating HX both clear
+// 0.5 bar on their own, and 0.5 bar is only ~100 ADC counts above the sensor's
+// 0.4 V zero, so sensor tolerance and the uncalibrated ESP32-S3 ADC eat much of
+// the margin. The result was a boiler-full latch during warm-up that cut the
+// pump before the GiCar could finish an autofill, leaving the boiler unfilled
+// until the next brew released the latch.
+const float BOILER_FULL_BAR_COLD = 1.0f;
+const float BOILER_FULL_BAR_HOT  = 5.0f;
+
+// The cut-off has to be seen continuously for this long before it latches, so
+// a single noisy ADC sample cannot kill a fill in progress.
+const unsigned long BOILER_FULL_DEBOUNCE_MS = 400;
+
+// How long the latch may hold without the pressure still justifying it. The
+// dimmer sits between the GiCar and the pump, so opening it while the GiCar is
+// not asking for the pump does nothing at all — re-arming costs nothing and
+// lets a latch that was set in error heal itself instead of waiting for a brew.
+const unsigned long BOILER_FULL_LATCH_TIMEOUT_MS = 45000;
+
+// primePressureFilter() seeds the low-pass filter from one raw ADC sample, and
+// updateIdlePumpControl() runs later in the same loop() iteration, so without
+// this window the very first latch decision is made with no smoothing at all.
+const unsigned long PRESSURE_SETTLE_MS = 1000;
+
+// Idle pressure above which the boiler is considered full. Follows the two
+// thresholds above: hot once steam is over 80°C, cold otherwise.
+float boilerFullPressureBar = BOILER_FULL_BAR_COLD;
 
 // Dimmer debug counters (global so brewDetect can seed them at brew start)
 unsigned long lastDimmerDebugMs = 0;
 uint32_t lastZeroCrossCountDebug = 0;
-// Latch: once pressure cuts the pump in idle, stay off until next brew ends
+// Latch: once pressure cuts the pump in idle, stay off until the next brew
+// ends or BOILER_FULL_LATCH_TIMEOUT_MS elapses without pressure to back it up
 bool boilerFullLatch = false;
+// millis() when the pressure first rose above the cut-off, 0 while it is below
+unsigned long boilerOverPressureSinceMs = 0;
+// millis() of the last moment the pressure justified the latch — the re-arm
+// timeout is measured from here, so a latch backed by real pressure never expires
+unsigned long boilerFullLatchedAtMs = 0;
+// millis() of the last primePressureFilter() call, start of the settle window
+unsigned long pressureFilterPrimedAtMs = 0;
 // Latch: once the weight reaches target minus the pressure-dependent offset
 // during a profiled brew, keep the pump off until the brew ends (lever released)
 bool targetWeightReached = false;
@@ -565,6 +599,8 @@ void setPumpBrightness(uint8_t brightness) {
 void resumeIdleBoilerFill()
 {
   boilerFullLatch = false;
+  boilerOverPressureSinceMs = 0;
+  boilerFullLatchedAtMs = 0;
   setPumpBrightness(255);
 }
 
@@ -573,6 +609,9 @@ void primePressureFilter()
   sensorVal = (float)analogRead(PRESSURE_SENSOR_PIN);
   filteredVal = sensorVal;
   voltage = (filteredVal / 4096.0f) * 3.3f;
+  // Opens the settle window: this single sample must not be trusted to latch
+  // the boiler-full cut-off before the low-pass filter has converged.
+  pressureFilterPrimedAtMs = millis();
 }
 
 // nunununununununununununununununununununununununununununununun
@@ -2971,6 +3010,13 @@ void updateDisplay()
 // When pressure is detected the boiler is full — cut dimmer so pump stops.
 // When pressure drops back to zero the boiler needs water — restore dimmer
 // to 100% so GiCar can run the pump through it unimpeded.
+//
+// Cutting the pump in error is the expensive mistake here, because the GiCar
+// cannot fill the boiler through a closed dimmer and nothing tells it why. So
+// the cut-off is deliberately reluctant: it needs a reading above a threshold
+// that ordinary warm-up pressure does not reach, held for BOILER_FULL_DEBOUNCE_MS,
+// on a filter that has had PRESSURE_SETTLE_MS to converge — and even then it
+// gives the pump back after BOILER_FULL_LATCH_TIMEOUT_MS without pressure.
 void updateIdlePumpControl()
 {
   if (brewActive) return;  // During brew, pressureProfile() owns the dimmer
@@ -2980,6 +3026,7 @@ void updateIdlePumpControl()
   // reflect the real sensor value.
   if (!POWER_ON)
   {
+    boilerOverPressureSinceMs = 0;
     if (pumpBrightness != 255) setPumpBrightness(255);
     return;
   }
@@ -2989,24 +3036,74 @@ void updateIdlePumpControl()
   // "boiler full" cut-off below must not fight it.
   if (cleaningModeActive || cleaningRunActive)
   {
+    boilerOverPressureSinceMs = 0;
     if (pumpBrightness != 255) setPumpBrightness(255);
     return;
   }
 
-  boilerFullPressureBar = (steamTemp > 80) ? 5.0f : 0.5f;
+  unsigned long now = millis();
+
+  // A latch the pressure no longer backs up is almost certainly a false trip
+  // (warm-up expansion, residual line pressure, a noisy sample). Release it
+  // rather than holding the pump off until the next brew: the GiCar owns the
+  // relay upstream of the dimmer, so an open dimmer only matters if the GiCar
+  // is actually asking to fill.
+  if (boilerFullLatch && (now - boilerFullLatchedAtMs > BOILER_FULL_LATCH_TIMEOUT_MS))
+  {
+    Serial.print("[FILL] Boiler-full latch timed out after ");
+    Serial.print(BOILER_FULL_LATCH_TIMEOUT_MS / 1000);
+    Serial.println("s without pressure — handing the pump back to the GiCar");
+    resumeIdleBoilerFill();
+  }
+
+  boilerFullPressureBar = (steamTemp > 80) ? BOILER_FULL_BAR_HOT : BOILER_FULL_BAR_COLD;
+
+  // Keep the filter converging, but do not let it latch anything until the
+  // seed sample from primePressureFilter() has been averaged away.
+  if (now - pressureFilterPrimedAtMs < PRESSURE_SETTLE_MS)
+  {
+    getPressure();
+    boilerOverPressureSinceMs = 0;
+    if (!boilerFullLatch && pumpBrightness != 255) setPumpBrightness(255);
+    return;
+  }
+
   float p = getPressure();
   if (p > boilerFullPressureBar)
   {
-    // Boiler has pressure — latch off and cut power
-    boilerFullLatch = true;
-    if (pumpBrightness != 0) setPumpBrightness(0);
+    // Require the cut-off to hold for BOILER_FULL_DEBOUNCE_MS before acting, so
+    // one bad reading cannot cut a fill that is already running.
+    if (boilerOverPressureSinceMs == 0) boilerOverPressureSinceMs = now;
+
+    if (now - boilerOverPressureSinceMs >= BOILER_FULL_DEBOUNCE_MS)
+    {
+      if (!boilerFullLatch)
+      {
+        Serial.print("[FILL] Boiler full — ");
+        Serial.print(p, 2);
+        Serial.print(" bar over the ");
+        Serial.print(boilerFullPressureBar, 2);
+        Serial.print(" bar cut-off (steam ");
+        Serial.print(steamTemp);
+        Serial.println("°C), cutting the pump");
+      }
+      // Pressure still justifies the latch, so restart the re-arm timeout
+      boilerFullLatch = true;
+      boilerFullLatchedAtMs = now;
+      if (pumpBrightness != 0) setPumpBrightness(0);
+    }
   }
-  else if (!boilerFullLatch)
+  else
   {
-    // No pressure and not latched — allow GiCar to run the pump
-    if (pumpBrightness != 255) setPumpBrightness(255);
+    boilerOverPressureSinceMs = 0;
+    if (!boilerFullLatch)
+    {
+      // No pressure and not latched — allow GiCar to run the pump
+      if (pumpBrightness != 255) setPumpBrightness(255);
+    }
+    // If latched and pressure is gone: stay at 0 until the brew ends or the
+    // re-arm timeout above releases the latch
   }
-  // If latched and pressure is gone: stay at 0 until brew ends
 }
 
 void setPressure(float targetValue)
