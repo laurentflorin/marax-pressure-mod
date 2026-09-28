@@ -129,7 +129,6 @@ bool scaleConnected = false;
 // nunununununununununununununununununununununununununununununun
 long serialMaraxUpdateMillis = millis();
 long updateMqttTimer = millis();
-long readSettigsRefreshTimer = millis();
 unsigned long pageRefreshTimer = millis();
 unsigned long refresh_timer = millis();
 unsigned long activeBrewingStart = millis();
@@ -148,33 +147,30 @@ EasyNex myNex(Serial2);
 
 // Forward declaration required because PubSubClient constructor references it
 void callbackfun(char *topic, byte *payload, unsigned int length);
-void showProfileSelection();
-void populateProfileList();
-void handleProfileSelection(int rowIndex);
-bool selectProfile(int profileIndex);
-void handleNextionProfileTouchEvents();
-void loadPersistedProfileSelection();
-void persistSelectedProfile();
-void loadPersistedTargetWeight();
-void persistTargetWeight();
-void updateTargetWeightUi(bool force);
-void updateProfileSelectionHighlight();
-bool loadProfile(const char *filename);
-void updateProfileModeText();
-void scanProfiles();
+void updateBrewHeader();
 bool readRawBrewSwitchOn();
 bool readDebouncedBrewSwitchOn();
 void writeBrewRelay(bool brewOn);
 void resumeIdleBoilerFill();
-void applyManualStepsToProfile();
-void publishProfileState();
-void processPendingProfileCommand();
-void buildProfileCsv(String &out);
+void processPendingRecipeCommand();
 float profileTotalSeconds();
 float profileTargetPressureAt(float second);
 int pressureToWave(float bar);
 void writeBrewTimerColour(uint32_t colour);
 void writeSetBarValue(int wave);
+void scanRecipes();
+bool loadRecipe(const char *stem);
+bool selectRecipe(const char *stem);
+void clearActiveRecipe();
+bool isRecipeActive();
+bool recipeInCharge();
+void setRecipeMode(bool enabled);
+void loadHomeSlots();
+void updateHomeSlotsUi();
+void writeRecipePanel();
+void handleHomeTileTap();
+void handleRecipeModeTap();
+void publishRecipeState();
 
 // nunununununununununununununununununununununununununununununun
 // nunununununununununununu MQTT Settings
@@ -198,21 +194,30 @@ void writeSetBarValue(int wave);
 // stale retained reading when the controller is unplugged or loses WiFi.
 #define availability_topic       "marax/status"
 
-// Profile editing. The controller publishes the profile list, the active
-// profile's name and its full body; commands arrive on the select/save/delete
-// topics and every one of them is answered on the result topic.
-//
-// The body is the same v2 CSV that lives on the SD card, in both directions.
-// Carrying one format end to end means the firmware never has to parse JSON:
-// it validates the bytes with the reader it already has and writes them
-// straight to the card.
-#define profile_list_topic       "marax/profile/list"
-#define profile_name_topic       "marax/profile/name"
-#define profile_active_topic     "marax/profile/active"
-#define profile_result_topic     "marax/profile/result"
-#define profile_select_topic     "marax/profile/select"
-#define profile_save_prefix      "marax/profile/save/"
-#define profile_delete_prefix    "marax/profile/delete/"
+// Recipe editing. The recipe body is the CSV that lives on the SD card, in
+// both directions. Carrying one format end to end means the firmware never has
+// to parse JSON: it validates the bytes with the reader it already has and
+// writes them straight to the card. Every command is answered on the result
+// topic, and the library is published as one retained topic per recipe. Which
+// recipe sits on which home-screen tile is its own topic, because a tile can
+// only hold one.
+#define recipe_list_topic        "marax/recipe/list"
+#define recipe_active_topic      "marax/recipe/active"
+#define recipe_home_topic        "marax/recipe/home"
+#define recipe_result_topic      "marax/recipe/result"
+#define recipe_select_topic      "marax/recipe/select"
+#define recipe_home_set_topic    "marax/recipe/home/set"
+#define recipe_save_prefix       "marax/recipe/save/"
+#define recipe_delete_prefix     "marax/recipe/delete/"
+#define recipe_body_prefix       "marax/recipe/body/"
+// "Brew by recipe" on or off, as ON / OFF so Home Assistant's switch takes the
+// payloads without templates.
+#define recipe_mode_topic        "marax/recipe/mode"
+#define recipe_mode_set_topic    "marax/recipe/mode/set"
+// Published on the active topic, and offered by the select entity, when no
+// recipe is in charge. The brackets cannot occur in a file name, so it can
+// never collide with a real recipe.
+#define RECIPE_NONE_OPTION       "(none)"
 
 // ─────────────────────────────────────────────────────────────────────────
 // Home Assistant MQTT discovery
@@ -229,16 +234,12 @@ void writeSetBarValue(int wave);
 
 // PubSubClient's default 256-byte buffer would silently drop every payload
 // bigger than that (publish() just returns false). The largest traffic here is
-// a full profile body and the profile-select discovery payload, which carries
-// one option per profile on the card.
+// a full recipe body and the recipe-select discovery payload, which carries
+// one option per recipe on the card.
 #define MQTT_BUFFER_SIZE         2048
-// Profile bodies are bounded so an oversized retained payload cannot be
+// Recipe bodies are bounded so an oversized retained payload cannot be
 // accepted and then fail to fit in the buffer on the way back out.
-#define PROFILE_BODY_MAX_LEN     1024
-// The select entity announces the profiles as options. Beyond this the payload
-// would not fit the buffer, so the list is cut and the truncation logged
-// rather than losing the whole announcement.
-#define PROFILE_SELECT_MAX_OPTIONS 40
+#define RECIPE_BODY_MAX_LEN      1024
 
 PubSubClient mqttClient(mqtt_server, 1883, callbackfun, wifiClient);
 
@@ -299,11 +300,11 @@ uint32_t lastPageId = 0;
 bool displayIsInSleep = true;
 
 // nunununununununununununununununununununununununununununununun
-// nunununununununununununu Pressure Profile
+// nunununununununununununu Pressure curve
 // nunununununununununununununununununununununununununununununun
-// A profile is a polyline. Each point anchors a target pressure at an absolute
-// time from the start of the shot, and `jump` says how the curve reaches that
-// point:
+// Every recipe carries a pressure curve: a polyline. Each point anchors a
+// target pressure at an absolute time from the start of the shot, and `jump`
+// says how the curve reaches that point:
 //
 //   ramp — interpolate linearly from the previous point
 //   jump — hold the previous pressure until this point's time, then step to it
@@ -325,124 +326,177 @@ struct ProfilePoint
   bool jump;      // true: step at `seconds`, false: ramp in from the point before
 };
 
+// The active recipe's curve — what the pump follows while brewing by recipe.
 ProfilePoint profilePoints[MAX_PROFILE_POINTS];
 int profilePointCount = 0;
 
-// Parsed from the profile file and preserved when it is written back, but
-// deliberately NOT applied to the running `targetWeight` — the brew-by-weight
-// target comes from the display and Preferences, and always has. Keeping the
-// field intact means hand-edited files do not lose it on a round trip.
-float profileTargetWeightField = 0.0f;
-
-// Manual mode only: the display's four fixed step fields. The Nextion firmware
-// has physical t1p…t4t inputs, so manual editing stays four steps; they are
-// converted into profilePoints[] by applyManualStepsToProfile().
-int t1p = 0, t1t = 0, t2p = 0, t2t = 0, t3p = 0, t3t = 0, t4p = 0, t4t = 0;
-
-// SD / Profile globals
-#define MAX_PROFILES 64
-#define PROFILE_NAME_MAX_LEN 32
+// SD and display globals
+#define RECIPE_NAME_MAX_LEN 32
 #define MAX_PATH_LEN 64
-#define PROFILE_FIELD_COUNT 10
-#define PROFILE_CSV_BUFFER_LEN 128
-#define PROFILE_ROWS_PER_PAGE 10
-#define PROFILE_TOUCH_COMPONENT_ID_MIN 5
-#define PROFILE_TOUCH_COMPONENT_ID_MAX 14
-// Fallback page ID for `profile1` (matches page order in MaraxDisplayFile.HMI).
-#define PROFILE_PAGE_ID_FALLBACK 4
+#define RECIPE_LINE_MAX_LEN 128
 // How long readNextionNumber() waits for a `get` reply before giving up. The
 // display answers in well under a millisecond at 115200 baud, so this is
 // generous; it only elapses when the display is busy, unplugged, or asked for
 // something that does not exist. Keep it well below the display refresh
 // interval so a dead read cannot stall the loop.
 #define NEXTION_READ_TIMEOUT_MS 150
-// Depth of the touch-event queue drained by handleNextionProfileTouchEvents().
-#define NEXTION_TOUCH_QUEUE_LEN 8
-// Row colours on the profile selection page (RGB565).
-#define PROFILE_ROW_PCO          65535  // white text
-#define PROFILE_ROW_BCO           8518  // dark slate background
-#define PROFILE_ROW_PCO_SELECTED  2016  // green text
-#define PROFILE_ROW_BCO_SELECTED 17036  // lighter slate background
-// Brew page graph, as defined in display/MaraxDisplayFile.HMI: the waveform
-// `s0` has object id 1, is 350 x 180 px with dis=100, and has two channels —
-// channel 0 carries the measured pressure, channel 1 the target. One sample
-// per x pixel, value 0..180 spanning 0..10 bar.
+// How long the next read waits for the late answer to a `get` that already
+// timed out, so it can be discarded instead of being taken for its own. The
+// display normally answers in well under a millisecond, so anything that has
+// not arrived by now is gone for good; keeping the window short bounds what a
+// dead display costs the loop.
+#define NEXTION_RESYNC_DRAIN_MS 40
+// Page indexes in the HMI, as `dp` reports them. Deleting a page in the
+// Nextion Editor renumbers every page after it, so check these against the
+// editor's Page panel (the first page is 0) after changing the page list. The
+// serial log prints the current page as "page:" every ten seconds.
+#define HOME_PAGE_ID 1
 #define BREW_PAGE_ID 2
+#define CLEANING_PAGE_ID 4
+// Brew page graph: the waveform `s0` has object id 1, is 300 x 180 px with
+// dis=100, and has two channels — channel 0 carries the measured pressure,
+// channel 1 the target. One sample per x pixel, value 0..180 spanning 0..10
+// bar. BREW_WAVEFORM_WIDTH must match the waveform's width in the HMI.
 #define BREW_WAVEFORM_ID 1
 #define BREW_WAVEFORM_TARGET_CHANNEL 1
-#define BREW_WAVEFORM_WIDTH 350
+#define BREW_WAVEFORM_WIDTH 300
 #define BREW_WAVEFORM_HEIGHT 180
 // Handshake timeouts for `addt` (transparent data mode): the display answers
 // 0xFE when it is ready for the raw bytes and 0xFD once it has taken them all.
 #define NEXTION_ADDT_READY_TIMEOUT_MS 200
 #define NEXTION_ADDT_DONE_TIMEOUT_MS 500
-// Bounds for manual-mode values read back from the display. Anything outside
-// these ranges is a garbled read.
-#define MANUAL_PRESSURE_MAX_BAR 12
-#define MANUAL_SEGMENT_MAX_SECONDS 600
 #define WEIGHT_STABLE_WINDOW_MS 2000  // how long weight must be stable before committing observation
 #define WEIGHT_STABLE_THRESHOLD 0.5f  // max increase (g) over stability window
 #define OBSERVATION_MAX_WAIT_MS 5000 // max time to wait for stability after brew stop
-char activeProfileName[PROFILE_NAME_MAX_LEN] = "default";
-char activeProfileFileStem[PROFILE_NAME_MAX_LEN] = "default";
-char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
-int profileCount = 0;
-String profileListStr = "";
-int selectedProfileIndex = 0;
-int profileListPageStart = 0;
-int profileSelectionPageId = PROFILE_PAGE_ID_FALLBACK;
-bool profilePageNeedsPopulate = true;
 // Set when the brew page's target-curve preview has to be (re)drawn: on
-// entering the page, and when the loaded profile changes while it is open.
+// entering the page, and when the recipe changes while it is open.
 bool brewPreviewNeedsDraw = false;
 uint32_t lastPreviewSignature = 0;
-unsigned long lastProfileScanMs = 0;
-const unsigned long PROFILE_SCAN_INTERVAL_MS = 30000;
-float targetWeight = 36.0f;
+unsigned long lastRecipeScanMs = 0;
+const unsigned long RECIPE_SCAN_INTERVAL_MS = 30000;
 bool sdReady = false;
-char persistedProfileFile[PROFILE_NAME_MAX_LEN] = "";
 Preferences preferences;
 
+// nunununununununununununununununununununununununununununununun
+// nunununununununununununu Recipes
+// nunununununununununununununununununununununununununununununun
+// A recipe is everything needed to pull the same coffee twice: the grinder
+// setting, the dose, the yield, the position of the Mara X temperature switch
+// and its own pressure curve. Recipes live on the SD card in /recipes/*.csv,
+// one `key,value` per line, so unknown keys can be ignored and the format can
+// grow without breaking older firmware:
+//
+//   # marax recipe v1
+//   name,Ethiopia Guji
+//   grind,2.4
+//   dose,18.0
+//   yield,40.0
+//   temp,II
+//   point,0.0,3.0,ramp
+//   point,8.0,9.0,jump
+//
+// Grind, dose and temperature are guidance for whoever is at the machine — the
+// grinder and the temperature switch are not under the controller's control.
+// While brewing by recipe, the yield is the brew-by-weight target and the
+// curve is what the pump follows. With brew by recipe switched off, the
+// machine brews as it would without this mod: full pump, no weight cut-off.
+#define MAX_RECIPES 24
+#define RECIPE_GRIND_MAX_LEN 16
+#define RECIPE_DOSE_MAX_G 40.0f
+#define RECIPE_YIELD_MAX_G 150.0f
+#define RECIPE_TEMP_UNSET -1
+#define RECIPE_HOME_SLOTS 3
+// Which recipe sits on which home-screen tile. Kept apart from the recipes
+// themselves so a tile can only ever hold one recipe, and moving a recipe onto
+// a tile is a single write rather than a rewrite of whichever file held it
+// before. Not a .csv, so scanRecipes() never takes it for a recipe.
+#define RECIPE_HOME_SLOTS_PATH "/recipes/home_slots.txt"
+// Home tile colours (RGB565): dark slate, and the recipe in charge lighter
+// with green text.
+#define RECIPE_TILE_PCO          65535
+#define RECIPE_TILE_BCO           8518
+#define RECIPE_TILE_PCO_ACTIVE    2016
+#define RECIPE_TILE_BCO_ACTIVE   17036
+
+struct RecipeInfo
+{
+  char stem[RECIPE_NAME_MAX_LEN];   // file name without .csv — the recipe's identity
+  char name[RECIPE_NAME_MAX_LEN];   // shown on the machine and in Home Assistant
+  char grind[RECIPE_GRIND_MAX_LEN];  // free text: "2.4", "14 clicks"
+  float dose;                        // grams in, 0 when not given
+  float yield;                       // grams out, 0 when not given
+  int temp;                          // 0, 1, 2 for the 0 / I / II switch, or RECIPE_TEMP_UNSET
+};
+
+// Every valid recipe on the card, as of the last scanRecipes().
+RecipeInfo recipes[MAX_RECIPES];
+int recipeCount = 0;
+// Filled in by parseRecipeLine() while a recipe body is read.
+RecipeInfo recipeScratch;
+// The recipe the machine is set up for. An empty stem means none is.
+RecipeInfo activeRecipe;
+char persistedRecipeStem[RECIPE_NAME_MAX_LEN] = "";
+// The settings page's one switch. Off, the machine brews as a stock Mara X
+// even with a recipe selected; the recipe is kept for when it goes back on.
+bool recipeModeEnabled = true;
+char homeSlotStems[RECIPE_HOME_SLOTS][RECIPE_NAME_MAX_LEN];
+// Filled in by parseHomeSlots(), so a rejected update leaves the tiles alone.
+char homeSlotScratch[RECIPE_HOME_SLOTS][RECIPE_NAME_MAX_LEN];
+// Set whenever what the home tiles show may have changed; they are rewritten
+// the next time the home page is open.
+bool homeSlotsUiDirty = true;
+// The tile the display reported a tap on (1-based), 0 when there is none.
+// Written by nextionProcessRx(), acted on by handleHomeTileTap().
+int pendingHomeTileTap = 0;
+// The settings switch as the display reported it: 0 off, 1 on, -1 nothing
+// new. Written by nextionProcessRx(), acted on by handleRecipeModeTap().
+int pendingRecipeModeTap = -1;
+// Shared read buffer for whole recipe files. A body is bounded by
+// what fits a single MQTT message, so nothing on the card is bigger than this.
+char sdTextBuffer[RECIPE_BODY_MAX_LEN];
+
 // Kept here rather than up with the other MQTT globals because the struct
-// sizes its members with PROFILE_NAME_MAX_LEN, defined just above.
+// sizes its members with RECIPE_NAME_MAX_LEN, defined just above.
 // MQTT commands are recorded by the callback and carried out later from the
 // main loop. The callback runs inside mqttClient.loop(); writing to the SD card
 // or publishing from in there would re-enter the client and stall the loop at
 // an arbitrary moment — including in the middle of a shot.
-enum ProfileCommandKind
+enum RecipeCommandKind
 {
-  PROFILE_CMD_NONE = 0,
-  PROFILE_CMD_SELECT,
-  PROFILE_CMD_SAVE,
-  PROFILE_CMD_DELETE,
-  PROFILE_CMD_TOO_LARGE  // recorded so the sender gets an answer either way
+  RECIPE_CMD_NONE = 0,
+  RECIPE_CMD_SELECT,
+  RECIPE_CMD_SAVE,
+  RECIPE_CMD_DELETE,
+  RECIPE_CMD_HOME,
+  RECIPE_CMD_MODE,
+  RECIPE_CMD_TOO_LARGE  // recorded so the sender gets an answer either way
 };
 
-struct PendingProfileCommand
+struct PendingRecipeCommand
 {
-  ProfileCommandKind kind;
-  char stem[PROFILE_NAME_MAX_LEN];
-  char body[PROFILE_BODY_MAX_LEN];
+  RecipeCommandKind kind;
+  char stem[RECIPE_NAME_MAX_LEN];
+  char body[RECIPE_BODY_MAX_LEN];
   unsigned int bodyLength;
 };
 
-PendingProfileCommand pendingProfileCommand = { PROFILE_CMD_NONE, "", "", 0 };
-// Set whenever the profile list or the active profile changes, so the retained
-// topics are refreshed from the main loop rather than from wherever the change
-// happened to occur.
-bool profileStateDirty = true;
+PendingRecipeCommand pendingRecipeCommand = { RECIPE_CMD_NONE, "", "", 0 };
+// Set whenever the recipe list, the active recipe, the home tiles or the
+// recipe mode change, so the retained topics are refreshed from the main loop
+// rather than from wherever the change happened to occur.
+bool recipeStateDirty = true;
+// Set when every recipe body has to be published again: after a (re)connect,
+// and when a periodic scan finds the card changed underneath us. Single saves
+// and deletes publish their own body directly.
+bool recipeLibraryDirty = true;
 
-// Touch events arriving on UART2 are queued by nextionProcessRx() instead of
-// being acted on where they are parsed, so a `get` reply can never swallow one.
-struct NextionTouchEvent
-{
-  uint8_t pageId;
-  uint8_t componentId;
-  uint8_t eventType;
-};
-NextionTouchEvent nextionTouchQueue[NEXTION_TOUCH_QUEUE_LEN];
-uint8_t nextionTouchQueueHead = 0;
-uint8_t nextionTouchQueueCount = 0;
+// Set when a `get` went unanswered inside NEXTION_READ_TIMEOUT_MS. A 0x71
+// reply carries a bare 4-byte value and no component name, so an answer that
+// arrives after its request gave up is indistinguishable from the answer to
+// the next request: every following read would return the previous
+// component's value. readNextionNumber() clears the stale reply before it
+// asks for anything else.
+bool nextionReadDesynced = false;
 
 FelicitaScale_NimBLE scale(SCALE_BLE_DEBUG);  // see SCALE_BLE_DEBUG above
 float currentWeight = 0.0f;
@@ -823,8 +877,7 @@ void setup()
   Serial.println("[DEBUG] Sent 0x11 wakeup to machine");
 
   preferences.begin("marax", false);
-  loadPersistedProfileSelection();
-  loadPersistedTargetWeight();
+  loadPersistedRecipe();
 
   // Serial Marax
   memset(receivedCharsFromMarax, 0, numCharsSerialMarax);
@@ -893,8 +946,8 @@ void setup()
     Serial.print("[SD] Mounted OK — card type: "); Serial.print(SD.cardType());
     Serial.print("  size: "); Serial.print(SD.totalBytes() / (1024 * 1024)); Serial.println(" MB");
 
-    if (!SD.exists("/profiles"))
-      SD.mkdir("/profiles");
+    if (!SD.exists("/recipes"))
+      SD.mkdir("/recipes");
     if (!SD.exists("/logs"))
       SD.mkdir("/logs");
 
@@ -903,51 +956,22 @@ void setup()
       File f = SD.open("/logs/brews.csv", FILE_WRITE);
       if (f)
       {
-        f.println("timestamp_ms,profile,actual_weight,target_weight,brew_time_s,flow_rate_at_stop,pressure_at_stop,extra_weight");
+        f.println("timestamp_ms,recipe,actual_weight,target_weight,brew_time_s,flow_rate_at_stop,pressure_at_stop,extra_weight");
         f.close();
       }
     }
 
-    scanProfiles();
-    lastProfileScanMs = millis();
+    scanRecipes();
+    lastRecipeScanMs = millis();
+    loadHomeSlots();
 
-    if (profileCount > 0)
+    // Back to the recipe that was in charge before the power went.
+    if (persistedRecipeStem[0] != '\0' && !loadRecipe(persistedRecipeStem))
     {
-      int startupIndex = 0;
-      if (persistedProfileFile[0] != '\0')
-      {
-        for (int i = 0; i < profileCount; i++)
-        {
-          if (strcmp(profileNames[i], persistedProfileFile) == 0)
-          {
-            startupIndex = i;
-            break;
-          }
-        }
-      }
-      selectProfile(startupIndex);
+      Serial.print("[RECIPE] Could not restore '"); Serial.print(persistedRecipeStem);
+      Serial.println("' — no recipe active");
+      preferences.remove("recipe");
     }
-
-    pressureProfilingEnabled = true;
-    remoteProfilingEnabled = true;
-    myNex.writeNum("pPEnabled", 1);
-    myNex.writeNum("remoteEnabled", 1);
-
-    Serial.print("[DEBUG] Setting up profiles - count:"); Serial.println(profileCount);
-    Serial.print("[DEBUG] Profile list string: "); Serial.println(profileListStr);
-    Serial.print("[DEBUG] Active profile: "); Serial.println(activeProfileName);
-    
-    // NOTE: profileList.txt and actProftxt.txt components must exist in HMI
-    myNex.writeStr("profileList.txt", profileListStr.c_str());
-    Serial.println("[DEBUG] Sent profileList.txt");
-    
-    myNex.writeStr("actProfile.txt", activeProfileName);
-    Serial.println("[DEBUG] Sent actProfiletxt.txt");
-    updateTargetWeightUi(true);
-    Serial.print("[DEBUG] Restored targetWeight: "); Serial.println((int)targetWeight);
-    
-    populateProfileList();
-    updateProfileModeText();
   }
   else
   {
@@ -957,6 +981,11 @@ void setup()
     Serial.print("  MOSI=GPIO"); Serial.print(SD_MOSI_PIN);
     Serial.print("  MISO=GPIO"); Serial.println(SD_MISO_PIN);
   }
+
+  // updateDisplay() keeps sending the mode from here on; this first write
+  // saves the settings page from showing the HMI default meanwhile.
+  myNex.writeNum("recipeMode", recipeModeEnabled ? 1 : 0);
+  updateBrewHeader();
 
   Serial.println("[DEBUG] setup() complete");
 }
@@ -980,10 +1009,12 @@ void loop()
 #endif
   checkPendingObservation();
 #ifndef DISABLE_WIFI_MQTT
-  processPendingProfileCommand();
+  processPendingRecipeCommand();
 #endif
 
-  handleNextionProfileTouchEvents();
+  serviceNextionRx();
+  handleHomeTileTap();
+  handleRecipeModeTap();
 
   getMaschineInput();
   updateDisplay();
@@ -1010,68 +1041,84 @@ void callbackfun(char *topic, byte *payload, unsigned int length)
 
   // One command at a time. Dropping the newer one is the safe choice: the
   // alternative is a queue that can fill up mid-shot.
-  if (pendingProfileCommand.kind != PROFILE_CMD_NONE)
+  if (pendingRecipeCommand.kind != RECIPE_CMD_NONE)
   {
-    Serial.println("[MQTT] Profile command dropped — one is already pending");
+    Serial.println("[MQTT] Recipe command dropped — one is already pending");
     return;
   }
 
-  ProfileCommandKind kind = PROFILE_CMD_NONE;
+  RecipeCommandKind kind = RECIPE_CMD_NONE;
   const char *stem = NULL;
 
-  if (strcmp(topic, profile_select_topic) == 0)
+  if (strcmp(topic, recipe_select_topic) == 0)
   {
-    kind = PROFILE_CMD_SELECT;
+    kind = RECIPE_CMD_SELECT;
   }
-  else if (strncmp(topic, profile_save_prefix, strlen(profile_save_prefix)) == 0)
+  else if (strcmp(topic, recipe_home_set_topic) == 0)
   {
-    kind = PROFILE_CMD_SAVE;
-    stem = topic + strlen(profile_save_prefix);
+    kind = RECIPE_CMD_HOME;
   }
-  else if (strncmp(topic, profile_delete_prefix, strlen(profile_delete_prefix)) == 0)
+  else if (strcmp(topic, recipe_mode_set_topic) == 0)
   {
-    kind = PROFILE_CMD_DELETE;
-    stem = topic + strlen(profile_delete_prefix);
+    kind = RECIPE_CMD_MODE;
+  }
+  else if (strncmp(topic, recipe_save_prefix, strlen(recipe_save_prefix)) == 0)
+  {
+    kind = RECIPE_CMD_SAVE;
+    stem = topic + strlen(recipe_save_prefix);
+  }
+  else if (strncmp(topic, recipe_delete_prefix, strlen(recipe_delete_prefix)) == 0)
+  {
+    kind = RECIPE_CMD_DELETE;
+    stem = topic + strlen(recipe_delete_prefix);
   }
   else
   {
     return;
   }
 
-  if (length >= sizeof(pendingProfileCommand.body))
+  if (length >= sizeof(pendingRecipeCommand.body))
   {
-    pendingProfileCommand.kind = PROFILE_CMD_TOO_LARGE;
-    pendingProfileCommand.bodyLength = 0;
-    pendingProfileCommand.body[0] = '\0';
-    pendingProfileCommand.stem[0] = '\0';
+    pendingRecipeCommand.kind = RECIPE_CMD_TOO_LARGE;
+    pendingRecipeCommand.bodyLength = 0;
+    pendingRecipeCommand.body[0] = '\0';
+    pendingRecipeCommand.stem[0] = '\0';
     return;
   }
 
-  pendingProfileCommand.stem[0] = '\0';
+  pendingRecipeCommand.stem[0] = '\0';
   if (stem != NULL)
   {
-    strncpy(pendingProfileCommand.stem, stem, sizeof(pendingProfileCommand.stem) - 1);
-    pendingProfileCommand.stem[sizeof(pendingProfileCommand.stem) - 1] = '\0';
+    strncpy(pendingRecipeCommand.stem, stem, sizeof(pendingRecipeCommand.stem) - 1);
+    pendingRecipeCommand.stem[sizeof(pendingRecipeCommand.stem) - 1] = '\0';
   }
 
-  memcpy(pendingProfileCommand.body, payload, length);
-  pendingProfileCommand.body[length] = '\0';
-  pendingProfileCommand.bodyLength = length;
+  memcpy(pendingRecipeCommand.body, payload, length);
+  pendingRecipeCommand.body[length] = '\0';
+  pendingRecipeCommand.bodyLength = length;
   // Written last: the main loop reads `kind` to decide whether the rest of the
   // struct is populated.
-  pendingProfileCommand.kind = kind;
+  pendingRecipeCommand.kind = kind;
 #endif
 }
 
 void updateMqtt()
 {
 #ifndef DISABLE_WIFI_MQTT
-  // Profile changes are published as they happen rather than on the 5-second
+  // Recipe changes are published as they happen rather than on the 5-second
   // tick, so the editor sees its own save land immediately.
-  if (profileStateDirty && mqttClient.connected() && !brewActive)
+  if (recipeStateDirty && mqttClient.connected() && !brewActive)
   {
-    publishProfileState();
-    profileStateDirty = false;
+    publishRecipeState();
+    recipeStateDirty = false;
+  }
+
+  // The whole library is a burst of SD reads and retained publishes, so it is
+  // held back while a shot runs like everything else here.
+  if (recipeLibraryDirty && mqttClient.connected() && !brewActive)
+  {
+    publishRecipeLibrary();
+    recipeLibraryDirty = false;
   }
 
   if ((millis() - updateMqttTimer > 5000) && !brewActive && POWER_ON)
@@ -1121,67 +1168,16 @@ String nextionEscapedText(const char *raw)
   return escaped;
 }
 
-void loadPersistedProfileSelection()
+void loadPersistedRecipe()
 {
-  persistedProfileFile[0] = '\0';
-  String savedFile = preferences.getString("selected_file", "");
-  if (savedFile.length() > 0)
+  recipeModeEnabled = preferences.getBool("recipe_mode", true);
+  persistedRecipeStem[0] = '\0';
+  String savedStem = preferences.getString("recipe", "");
+  if (savedStem.length() > 0)
   {
-    savedFile.toCharArray(persistedProfileFile, sizeof(persistedProfileFile));
-    persistedProfileFile[sizeof(persistedProfileFile) - 1] = '\0';
+    savedStem.toCharArray(persistedRecipeStem, sizeof(persistedRecipeStem));
+    persistedRecipeStem[sizeof(persistedRecipeStem) - 1] = '\0';
   }
-}
-
-void persistSelectedProfile()
-{
-  if (selectedProfileIndex < 0 || selectedProfileIndex >= profileCount)
-  {
-    return;
-  }
-  preferences.putString("selected_file", profileNames[selectedProfileIndex]);
-}
-
-void loadPersistedTargetWeight()
-{
-  float savedTargetWeight = preferences.getFloat("target_weight", targetWeight);
-  if (savedTargetWeight > 0.0f)
-  {
-    targetWeight = savedTargetWeight;
-  }
-}
-
-void persistTargetWeight()
-{
-  if (targetWeight > 0.0f)
-  {
-    preferences.putFloat("target_weight", targetWeight);
-  }
-}
-
-void updateTargetWeightUi(bool force)
-{
-  static int lastSentTargetWeight = -1;
-  static bool lastWasProfilePage = false;
-  int value = (int)targetWeight;
-
-  bool onProfilePage =
-      currentPageId == (uint32_t)profileSelectionPageId ||
-      currentPageId == (uint32_t)(0xFF000000 | profileSelectionPageId);
-
-  if (!force && value == lastSentTargetWeight && onProfilePage == lastWasProfilePage)
-  {
-    return;
-  }
-
-  myNex.writeNum("targetWeight", value);
-
-  if (onProfilePage)
-  {
-    sendNextionCommand("ntargetW.val=" + String(value));
-  }
-
-  lastSentTargetWeight = value;
-  lastWasProfilePage = onProfilePage;
 }
 
 bool isBrewPage(uint32_t pageId)
@@ -1190,182 +1186,15 @@ bool isBrewPage(uint32_t pageId)
          pageId == (uint32_t)(0xFF000000 | BREW_PAGE_ID);
 }
 
-bool isProfileSelectionPage(uint32_t pageId)
+bool isHomePage(uint32_t pageId)
 {
-  return pageId == (uint32_t)profileSelectionPageId ||
-         pageId == (uint32_t)(0xFF000000 | profileSelectionPageId);
-}
-
-void syncTargetWeightFromDisplay()
-{
-  static int lastPersistedTargetWeight = -1;
-  uint32_t rawTargetWeight = 0;
-
-  // Guard against failed readNumber() responses and out-of-range values.
-  if (!readNextionNumber("targetWeight", rawTargetWeight) ||
-      rawTargetWeight < 1 || rawTargetWeight > 150)
-  {
-    return;
-  }
-
-  int manualTargetWeight = (int)rawTargetWeight;
-
-  if (manualTargetWeight != (int)targetWeight)
-  {
-    Serial.print("[DEBUG] Target weight changed: "); Serial.print(targetWeight);
-    Serial.print("g -> "); Serial.print(manualTargetWeight); Serial.println("g");
-    targetWeight = (float)manualTargetWeight;
-  }
-
-  updateTargetWeightUi(false);
-
-  if (manualTargetWeight != lastPersistedTargetWeight)
-  {
-    persistTargetWeight();
-    lastPersistedTargetWeight = manualTargetWeight;
-  }
-}
-
-// Marks the selected row by swapping its colours.
-//
-// The previous implementation used `.style=border` / `.borderw` / `.borderc`.
-// None of those work here: `style` is not a writable attribute on any Nextion
-// (and `border` is not a number), and the border attributes exist only on the
-// Intelligent series, not on the Basic/Enhanced 3.5" panel this project uses.
-// Every one of those commands failed, and each failure used to come back as a
-// junk packet on UART2.
-void updateProfileSelectionHighlight()
-{
-  for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
-  {
-    int profileIndex = profileListPageStart + row;
-    if (profileIndex < 0 || profileIndex >= profileCount)
-    {
-      continue;
-    }
-
-    bool selected = (profileIndex == selectedProfileIndex);
-    String component = "profile1.t" + String(row);
-    sendNextionCommand(component + ".pco=" + String(selected ? PROFILE_ROW_PCO_SELECTED : PROFILE_ROW_PCO));
-    sendNextionCommand(component + ".bco=" + String(selected ? PROFILE_ROW_BCO_SELECTED : PROFILE_ROW_BCO));
-  }
-}
-
-void populateProfileList()
-{
-  for (int row = 0; row < PROFILE_ROWS_PER_PAGE; row++)
-  {
-    int profileIndex = profileListPageStart + row;
-    String component = "profile1.t" + String(row);
-
-    if (profileIndex >= 0 && profileIndex < profileCount)
-    {
-      String stem = profileNames[profileIndex];
-      if (stem.endsWith(".csv"))
-      {
-        stem.remove(stem.length() - 4);
-      }
-
-      // Colours are set by updateProfileSelectionHighlight() below, which runs
-      // for every visible row — no need to write them twice.
-      sendNextionCommand(component + ".txt=\"" + nextionEscapedText(stem.c_str()) + "\"");
-      sendNextionCommand(component + ".vis=1");
-    }
-    else
-    {
-      sendNextionCommand(component + ".vis=0");
-    }
-  }
-
-  updateProfileSelectionHighlight();
-}
-
-bool selectProfile(int profileIndex)
-{
-  if (profileIndex < 0 || profileIndex >= profileCount)
-  {
-    return false;
-  }
-
-  if (!loadProfile(profileNames[profileIndex]))
-  {
-    return false;
-  }
-
-  selectedProfileIndex = profileIndex;
-  profileStateDirty = true;
-  myNex.writeStr("actProfile.txt", activeProfileName);
-  updateProfileModeText();
-  persistSelectedProfile();
-  updateProfileSelectionHighlight();
-  return true;
-}
-
-void handleProfileSelection(int rowIndex)
-{
-  int profileIndex = profileListPageStart + rowIndex;
-  // Stay on the profile list after a selection — selectProfile() has already
-  // moved the highlight to the new row, which is the feedback the user needs.
-  // Leaving the page is the display's job, via the HMI's own back button.
-  selectProfile(profileIndex);
-}
-
-void showProfileSelection()
-{
-  if (sdReady)
-  {
-    scanProfiles();
-    lastProfileScanMs = millis();
-  }
-
-  profileListPageStart = 0;
-
-  sendNextionCommand("page profile1");
-
-  delay(50);   // test with 50-100 ms first
-
-  populateProfileList();
-
-  profilePageNeedsPopulate = false;
-}
-// Appends a touch event to the queue. If the queue is full the oldest event is
-// dropped — the most recent touch is the one the user is waiting on.
-void queueNextionTouchEvent(uint8_t pageId, uint8_t componentId, uint8_t eventType)
-{
-  if (nextionTouchQueueCount >= NEXTION_TOUCH_QUEUE_LEN)
-  {
-    nextionTouchQueueHead = (nextionTouchQueueHead + 1) % NEXTION_TOUCH_QUEUE_LEN;
-    nextionTouchQueueCount--;
-  }
-
-  uint8_t tail = (nextionTouchQueueHead + nextionTouchQueueCount) % NEXTION_TOUCH_QUEUE_LEN;
-  nextionTouchQueue[tail].pageId = pageId;
-  nextionTouchQueue[tail].componentId = componentId;
-  nextionTouchQueue[tail].eventType = eventType;
-  nextionTouchQueueCount++;
-}
-
-// Plain scalar out-parameters rather than a NextionTouchEvent reference: the
-// Arduino builder auto-generates prototypes for every function in the sketch,
-// and keeping sketch-defined types out of those signatures avoids depending on
-// where in the file it decides to place them.
-bool popNextionTouchEvent(uint8_t &pageId, uint8_t &componentId, uint8_t &eventType)
-{
-  if (nextionTouchQueueCount == 0)
-  {
-    return false;
-  }
-
-  pageId = nextionTouchQueue[nextionTouchQueueHead].pageId;
-  componentId = nextionTouchQueue[nextionTouchQueueHead].componentId;
-  eventType = nextionTouchQueue[nextionTouchQueueHead].eventType;
-  nextionTouchQueueHead = (nextionTouchQueueHead + 1) % NEXTION_TOUCH_QUEUE_LEN;
-  nextionTouchQueueCount--;
-  return true;
+  return pageId == (uint32_t)HOME_PAGE_ID ||
+         pageId == (uint32_t)(0xFF000000 | HOME_PAGE_ID);
 }
 
 // Single entry point for everything arriving on UART2.
-//   * 0x65 touch packets are queued for handleNextionProfileTouchEvents().
+//   * A 0x23 packet from a home tile or the recipe switch is recorded for
+//     handleHomeTileTap() / handleRecipeModeTap().
 //   * A 0x71 numeric reply is decoded into `capture`, when one is supplied.
 //   * Any other byte is dropped so the stream resynchronises. The old handler
 //     returned on the first unrecognised byte, which let a single stray byte
@@ -1384,11 +1213,37 @@ bool nextionProcessRx(uint32_t *capture)
         return false;  // rest of the packet is still in flight
       }
 
+      // Nothing acts on plain touch events any more — every control that
+      // matters sends its own 0x23 packet — but they are still consumed
+      // whole, so their bytes cannot be mistaken for the start of another
+      // packet.
       uint8_t packet[7];
       Serial2.readBytes(packet, sizeof(packet));
-      if (packet[4] == 0xFF && packet[5] == 0xFF && packet[6] == 0xFF)
+      continue;
+    }
+
+    if (head == 0x23)
+    {
+      // `printh 23 02 <command> <value>` from a touch event in the HMI:
+      //   'R' 1..3 — home tile rN was tapped
+      //   'M' 0/1  — the settings page's "Brew by recipe" switch
+      // Custom packets rather than plain touch events, so they do not depend
+      // on the component ids the Nextion Editor happens to hand out.
+      if (Serial2.available() < 4)
       {
-        queueNextionTouchEvent(packet[1], packet[2], packet[3]);
+        return false;
+      }
+
+      uint8_t packet[4];
+      Serial2.readBytes(packet, sizeof(packet));
+      if (packet[1] == 0x02 && packet[2] == 'R' &&
+          packet[3] >= 1 && packet[3] <= RECIPE_HOME_SLOTS)
+      {
+        pendingHomeTileTap = packet[3];
+      }
+      else if (packet[1] == 0x02 && packet[2] == 'M' && packet[3] <= 1)
+      {
+        pendingRecipeModeTap = packet[3];
       }
       continue;
     }
@@ -1426,8 +1281,8 @@ void serviceNextionRx()
 }
 
 // Waits for a single status byte from the display — the 0xFE / 0xFD handshake
-// of `addt`. Touch events arriving in the meantime are queued as usual, so a
-// press during a preview redraw is not lost.
+// of `addt`. Only runs on the brew page, where no control sends anything, so
+// a plain touch event arriving meanwhile is simply skipped.
 bool nextionWaitForStatus(uint8_t expected, unsigned long timeoutMs)
 {
   unsigned long startMs = millis();
@@ -1444,10 +1299,6 @@ bool nextionWaitForStatus(uint8_t expected, unsigned long timeoutMs)
 
         uint8_t packet[7];
         Serial2.readBytes(packet, sizeof(packet));
-        if (packet[4] == 0xFF && packet[5] == 0xFF && packet[6] == 0xFF)
-        {
-          queueNextionTouchEvent(packet[1], packet[2], packet[3]);
-        }
         continue;
       }
 
@@ -1460,62 +1311,6 @@ bool nextionWaitForStatus(uint8_t expected, unsigned long timeoutMs)
   }
 
   return false;
-}
-
-void handleNextionProfileTouchEvents()
-{
-  static uint8_t handledPressComponentId = 0xFF;
-
-  serviceNextionRx();
-
-  uint8_t pageId = 0;
-  uint8_t componentId = 0;
-  uint8_t eventType = 0;
-  while (popNextionTouchEvent(pageId, componentId, eventType))
-  {
-    bool isProfileRowTouch =
-        componentId >= PROFILE_TOUCH_COMPONENT_ID_MIN &&
-        componentId <= PROFILE_TOUCH_COMPONENT_ID_MAX;
-
-    bool isProfilePageEvent =
-        pageId == (uint8_t)profileSelectionPageId ||
-        pageId == (uint8_t)PROFILE_PAGE_ID_FALLBACK;
-
-    if (!isProfileRowTouch || !isProfilePageEvent)
-    {
-      continue;
-    }
-
-    int rowIndex = componentId - PROFILE_TOUCH_COMPONENT_ID_MIN;
-
-    // Some HMI objects are configured to send press events, others release.
-    // Handle both edges while suppressing duplicate handling on release.
-    if (eventType == 1)
-    {
-      handledPressComponentId = componentId;
-      profileSelectionPageId = pageId;
-      handleProfileSelection(rowIndex);
-    }
-    else if (eventType == 0)
-    {
-      if (handledPressComponentId == componentId)
-      {
-        handledPressComponentId = 0xFF;
-        continue;
-      }
-
-      handledPressComponentId = 0xFF;
-      profileSelectionPageId = pageId;
-      handleProfileSelection(rowIndex);
-    }
-  }
-}
-
-// Optional EasyNextion trigger hook for opening the profile page.
-// Can be bound in HMI with: printh 23 02 54 32
-void trigger50()
-{
-  //showProfileSelection();
 }
 
 // Weight the pump is cut early by, so the drip-through after the pump stops
@@ -1531,105 +1326,17 @@ float weightStopOffset(float pressure)
   return 2.0f;
 }
 
-// Copies a profile's display name, truncating rather than overflowing.
-static void setActiveProfileName(const char *name)
-{
-  strncpy(activeProfileName, name, sizeof(activeProfileName) - 1);
-  activeProfileName[sizeof(activeProfileName) - 1] = '\0';
-}
-
-// Recognises the fixed ten-column layout this mod shipped with:
-//   name,t1p,t1t,t2p,t2t,t3p,t3t,t4p,t4t,target_weight
-static bool isLegacyProfileHeader(const String &header)
-{
-  return header.startsWith("name,t1p");
-}
-
-// Converts a legacy row into the polyline. Each of the four segments held its
-// pressure for its own duration, so every point is a jump — the staircase is
-// preserved exactly, and the profile still ends after the same total time.
-static bool parseLegacyProfileRow(const String &row)
-{
-  char buf[PROFILE_CSV_BUFFER_LEN];
-  row.toCharArray(buf, sizeof(buf));
-
-  int steps[8] = { 0 };
-  int idx = 0;
-  char *token = strtok(buf, ",");
-  while (token != NULL && idx < PROFILE_FIELD_COUNT)
-  {
-    if (idx == 0)
-    {
-      setActiveProfileName(token);
-    }
-    else if (idx <= 8)
-    {
-      steps[idx - 1] = atoi(token);
-    }
-    else
-    {
-      // Parsed so a round trip through Home Assistant does not lose it, but
-      // never applied — see profileTargetWeightField.
-      profileTargetWeightField = atof(token);
-    }
-    idx++;
-    token = strtok(NULL, ",");
-  }
-
-  if (idx < PROFILE_FIELD_COUNT)
-  {
-    return false;
-  }
-
-  t1p = steps[0]; t1t = steps[1];
-  t2p = steps[2]; t2t = steps[3];
-  t3p = steps[4]; t3t = steps[5];
-  t4p = steps[6]; t4t = steps[7];
-  applyManualStepsToProfile();
-  return true;
-}
-
-// Parses one line of the v2 format. Every line is `key,values…`, so unknown
-// keys can be ignored and the format stays extensible:
+// Parses one curve line of a recipe:
 //
-//   # comment
-//   name,Classic Espresso
-//   target_weight,36.0
 //   point,<seconds>,<bar>[,ramp|jump]
 //
-// Returns false only on a line that would corrupt the profile; an unknown key
-// is not an error.
-static bool parseProfileV2Line(char *line)
+// `seconds` is measured from the start of the shot, not a segment length.
+// Returns false on a line that would corrupt the curve.
+static bool parsePointLine(char *line)
 {
-  char *key = strtok(line, ",");
-  if (key == NULL)
+  if (strtok(line, ",") == NULL)
   {
-    return true;
-  }
-
-  if (strcmp(key, "name") == 0)
-  {
-    char *value = strtok(NULL, ",");
-    if (value != NULL)
-    {
-      setActiveProfileName(value);
-    }
-    return true;
-  }
-
-  if (strcmp(key, "target_weight") == 0)
-  {
-    char *value = strtok(NULL, ",");
-    if (value != NULL)
-    {
-      profileTargetWeightField = atof(value);
-    }
-    return true;
-  }
-
-  if (strcmp(key, "point") != 0)
-  {
-    return true;
+    return false;
   }
 
   char *secondsToken = strtok(NULL, ",");
@@ -1641,7 +1348,7 @@ static bool parseProfileV2Line(char *line)
   }
   if (profilePointCount >= MAX_PROFILE_POINTS)
   {
-    Serial.println("[SD] loadProfile: too many points, truncating");
+    Serial.println("[SD] recipe has too many points");
     return false;
   }
 
@@ -1655,7 +1362,7 @@ static bool parseProfileV2Line(char *line)
   // would silently skip segments. Reject it instead.
   if (profilePointCount > 0 && point.seconds < profilePoints[profilePointCount - 1].seconds)
   {
-    Serial.println("[SD] loadProfile: points are not in ascending time order");
+    Serial.println("[SD] recipe points are not in ascending time order");
     return false;
   }
 
@@ -1663,106 +1370,798 @@ static bool parseProfileV2Line(char *line)
   return true;
 }
 
-bool loadProfile(const char *filename)
+// Recipe names become file names and MQTT topic levels, so only
+// characters that cannot escape their directory are allowed. Rejecting '.'
+// outright rules out '..' and any extension games without needing to reason
+// about path traversal, and ',' can never break the comma-separated lists.
+static bool sanitizeRecipeStem(const char *raw, char *out, size_t outLen)
 {
-  if (!sdReady)
+  if (raw == NULL)
   {
-    Serial.println("[SD] loadProfile: sdReady=false");
     return false;
   }
 
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/profiles/%s", filename);
-  Serial.print("[SD] loadProfile: opening '"); Serial.print(path); Serial.println("'");
+  size_t length = strlen(raw);
+  // Room for the stem plus the ".csv" the caller appends.
+  if (length == 0 || length + 5 > outLen)
+  {
+    return false;
+  }
+
+  for (size_t i = 0; i < length; i++)
+  {
+    char c = raw[i];
+    bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_' || c == '-';
+    if (!allowed)
+    {
+      return false;
+    }
+    out[i] = c;
+  }
+  out[length] = '\0';
+  return true;
+}
+
+// Accepts the temperature switch position the way it is printed on the
+// machine (0, I, II) as well as plain digits. Anything else means "not given".
+static int parseRecipeTemp(const char *value)
+{
+  if (strcmp(value, "0") == 0) return 0;
+  if (strcmp(value, "I") == 0 || strcmp(value, "1") == 0) return 1;
+  if (strcmp(value, "II") == 0 || strcmp(value, "2") == 0) return 2;
+  return RECIPE_TEMP_UNSET;
+}
+
+static const char *recipeTempLabel(int temp)
+{
+  if (temp == 0) return "0";
+  if (temp == 1) return "I";
+  if (temp == 2) return "II";
+  return "-";
+}
+
+// Starts recipeScratch afresh for the file `stem`. A file without a name line
+// is shown under its file name.
+static void resetRecipeScratch(const char *stem)
+{
+  memset(&recipeScratch, 0, sizeof(recipeScratch));
+  strncpy(recipeScratch.stem, stem, sizeof(recipeScratch.stem) - 1);
+  strncpy(recipeScratch.name, stem, sizeof(recipeScratch.name) - 1);
+  recipeScratch.temp = RECIPE_TEMP_UNSET;
+}
+
+// Copies a text value without its surrounding blanks, truncating rather than
+// overflowing. A double quote or backslash would end or escape the string in
+// the display command that shows it, so they are swapped for harmless look-
+// alikes here, once, instead of at every place the text is sent.
+static void copyTrimmedValue(char *out, size_t outLen, const char *value)
+{
+  while (*value == ' ' || *value == '\t')
+  {
+    value++;
+  }
+  strncpy(out, value, outLen - 1);
+  out[outLen - 1] = '\0';
+  size_t n = strlen(out);
+  while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t'))
+  {
+    out[--n] = '\0';
+  }
+  for (size_t i = 0; i < n; i++)
+  {
+    if (out[i] == '"') out[i] = '\'';
+    if (out[i] == '\\') out[i] = '/';
+  }
+}
+
+// One line of a recipe. Curve lines go to parsePointLine(), the recipe keys
+// fill recipeScratch. Text values run to the end of the line, so a grind
+// setting written "2,4" survives intact. An unknown key is ignored rather
+// than rejected, so the format can grow without breaking older firmware.
+static bool parseRecipeLine(char *line)
+{
+  char *comma = strchr(line, ',');
+  if (comma == NULL)
+  {
+    return true;
+  }
+
+  if (strncmp(line, "point,", 6) == 0)
+  {
+    return parsePointLine(line);
+  }
+
+  *comma = '\0';
+  const char *key = line;
+  const char *value = comma + 1;
+
+  if (strcmp(key, "name") == 0)
+  {
+    char name[RECIPE_NAME_MAX_LEN];
+    copyTrimmedValue(name, sizeof(name), value);
+    if (name[0] != '\0')
+    {
+      strncpy(recipeScratch.name, name, sizeof(recipeScratch.name));
+    }
+  }
+  else if (strcmp(key, "grind") == 0)
+  {
+    copyTrimmedValue(recipeScratch.grind, sizeof(recipeScratch.grind), value);
+  }
+  else if (strcmp(key, "dose") == 0)
+  {
+    recipeScratch.dose = constrain((float)atof(value), 0.0f, RECIPE_DOSE_MAX_G);
+  }
+  else if (strcmp(key, "yield") == 0)
+  {
+    recipeScratch.yield = constrain((float)atof(value), 0.0f, RECIPE_YIELD_MAX_G);
+  }
+  else if (strcmp(key, "temp") == 0)
+  {
+    char temp[4];
+    copyTrimmedValue(temp, sizeof(temp), value);
+    recipeScratch.temp = parseRecipeTemp(temp);
+  }
+  return true;
+}
+
+// Splits a recipe body into lines and hands each to parseRecipeLine(). Returns
+// false on the first line that would corrupt the curve, or on a line too long
+// for the parser's buffer — that is malformed, not something to truncate
+// silently. The caller checks the point count.
+static bool parseBodyLines(const char *body)
+{
+  const char *cursor = body;
+  char line[RECIPE_LINE_MAX_LEN];
+
+  // A UTF-8 byte-order mark from a desktop editor. It is invisible, and would
+  // otherwise make the first key unrecognisable.
+  if ((uint8_t)cursor[0] == 0xEF && (uint8_t)cursor[1] == 0xBB && (uint8_t)cursor[2] == 0xBF)
+  {
+    cursor += 3;
+  }
+
+  while (*cursor != '\0')
+  {
+    size_t n = 0;
+    while (*cursor != '\0' && *cursor != '\n' && n < sizeof(line) - 1)
+    {
+      line[n++] = *cursor++;
+    }
+    if (*cursor != '\0' && *cursor != '\n')
+    {
+      return false;
+    }
+    if (*cursor == '\n')
+    {
+      cursor++;
+    }
+    line[n] = '\0';
+
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t'))
+    {
+      line[--n] = '\0';
+    }
+
+    if (n == 0 || line[0] == '#')
+    {
+      continue;
+    }
+    if (!parseRecipeLine(line))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Parses a body with the real reader, then puts back the curve that was
+// loaded before. Validating with the same code that will later read the file
+// off the card is the point: nothing can be accepted here and rejected on
+// reload. The caller resets recipeScratch first and finds the result there;
+// the pump's curve is untouched either way.
+static bool validateRecipeBody(const char *body)
+{
+  ProfilePoint savedPoints[MAX_PROFILE_POINTS];
+  int savedCount = profilePointCount;
+  memcpy(savedPoints, profilePoints, sizeof(savedPoints));
+
+  profilePointCount = 0;
+  bool ok = parseBodyLines(body) && profilePointCount >= PROFILE_MIN_POINTS;
+
+  memcpy(profilePoints, savedPoints, sizeof(profilePoints));
+  profilePointCount = savedCount;
+  return ok;
+}
+
+// "grind_a,grind_b," — one recipe file name per home tile, left to right, an
+// empty entry for an unused tile. Every name has to be a valid file name, but
+// the recipe need not exist: a tile whose recipe is missing is simply not
+// shown. The result lands in homeSlotScratch so a rejected update changes
+// nothing.
+static bool parseHomeSlots(const char *text)
+{
+  memset(homeSlotScratch, 0, sizeof(homeSlotScratch));
+
+  int slot = 0;
+  const char *cursor = text;
+  while (true)
+  {
+    const char *end = cursor;
+    while (*end != '\0' && *end != ',' && *end != '\n' && *end != '\r')
+    {
+      end++;
+    }
+
+    char field[RECIPE_NAME_MAX_LEN];
+    size_t length = (size_t)(end - cursor);
+    if (length >= sizeof(field))
+    {
+      return false;
+    }
+    memcpy(field, cursor, length);
+    field[length] = '\0';
+
+    if (field[0] != '\0')
+    {
+      if (slot >= RECIPE_HOME_SLOTS ||
+          !sanitizeRecipeStem(field, homeSlotScratch[slot], sizeof(homeSlotScratch[slot])))
+      {
+        return false;
+      }
+    }
+    slot++;
+
+    if (*end != ',')
+    {
+      break;
+    }
+    cursor = end + 1;
+  }
+  return true;
+}
+
+// Grams as the display shows them: "18" for a whole number, "18.5" otherwise.
+static void formatGrams(float grams, char *out, size_t outLen)
+{
+  float rounded = (float)(int)(grams + 0.5f);
+  if (grams - rounded < 0.05f && rounded - grams < 0.05f)
+  {
+    snprintf(out, outLen, "%d", (int)rounded);
+  }
+  else
+  {
+    snprintf(out, outLen, "%.1f", grams);
+  }
+}
+
+// The text of a home tile, one fact per line — the tile is a multi-line
+// button, and `\r` is the display's own line-break escape:
+//
+//   Ethiopia Guji
+//   18g > 40g
+//   Grind 2.4
+//   Temp II
+//
+// Lines for values the recipe does not give are left out rather than shown
+// empty.
+static void buildHomeTileText(const RecipeInfo &recipe, char *out, size_t outLen)
+{
+  char dose[12];
+  char yieldText[12];
+  formatGrams(recipe.dose, dose, sizeof(dose));
+  formatGrams(recipe.yield, yieldText, sizeof(yieldText));
+
+  char weightLine[32] = "";
+  char grindLine[32] = "";
+  char tempLine[16] = "";
+  if (recipe.dose > 0.0f && recipe.yield > 0.0f)
+  {
+    snprintf(weightLine, sizeof(weightLine), "\\r%sg > %sg", dose, yieldText);
+  }
+  else if (recipe.yield > 0.0f)
+  {
+    snprintf(weightLine, sizeof(weightLine), "\\rOut %sg", yieldText);
+  }
+  if (recipe.grind[0] != '\0')
+  {
+    snprintf(grindLine, sizeof(grindLine), "\\rGrind %s", recipe.grind);
+  }
+  if (recipe.temp != RECIPE_TEMP_UNSET)
+  {
+    snprintf(tempLine, sizeof(tempLine), "\\rTemp %s", recipeTempLabel(recipe.temp));
+  }
+
+  snprintf(out, outLen, "%s%s%s%s", recipe.name, weightLine, grindLine, tempLine);
+}
+
+// Reads a whole file into `buffer`. Refuses rather than truncates one that
+// does not fit, since half a curve is worse than none.
+static bool readSdTextFile(const char *path, char *buffer, size_t bufferLen)
+{
   File f = SD.open(path);
   if (!f)
   {
-    Serial.print("[SD] loadProfile: FAILED to open '"); Serial.print(path); Serial.println("'");
     return false;
   }
-  Serial.print("[SD] loadProfile: opened OK — size="); Serial.println(f.size());
 
-  strncpy(activeProfileFileStem, filename, sizeof(activeProfileFileStem) - 1);
-  activeProfileFileStem[sizeof(activeProfileFileStem) - 1] = '\0';
-  char *ext = strrchr(activeProfileFileStem, '.');
-  if (ext != NULL)
+  size_t size = f.size();
+  if (size >= bufferLen)
   {
-    *ext = '\0';
+    f.close();
+    Serial.print("[SD] "); Serial.print(path); Serial.println(" is too large to read");
+    return false;
   }
-  setActiveProfileName(activeProfileFileStem);
 
-  // Parse into scratch state first: a half-read file must not leave the pump
-  // following a profile that is partly the old one and partly the new.
+  size_t n = f.read((uint8_t *)buffer, size);
+  f.close();
+  buffer[n] = '\0';
+  return n == size;
+}
+
+// On the ESP32 core FILE_WRITE is "w", so this replaces the file rather than
+// appending to it.
+static bool writeSdTextFile(const char *path, const char *body)
+{
+  File f = SD.open(path, FILE_WRITE);
+  if (!f)
+  {
+    Serial.print("[SD] cannot open "); Serial.print(path); Serial.println(" for writing");
+    return false;
+  }
+
+  size_t expected = strlen(body);
+  size_t written = f.print(body);
+  // Every reader here takes a line at a time, so a body that does not end in
+  // a newline would lose its last line on the way back in.
+  if (expected > 0 && body[expected - 1] != '\n')
+  {
+    f.print('\n');
+  }
+  f.close();
+
+  if (written != expected)
+  {
+    Serial.print("[SD] short write to "); Serial.println(path);
+    return false;
+  }
+  return true;
+}
+
+static int findRecipeIndex(const char *stem)
+{
+  for (int i = 0; i < recipeCount; i++)
+  {
+    if (strcmp(recipes[i].stem, stem) == 0)
+    {
+      return i;
+    }
+  }
+  return -1;
+}
+
+bool isRecipeActive()
+{
+  return activeRecipe.stem[0] != '\0';
+}
+
+// Reads every recipe on the card. Each one is checked with the full parser, so
+// a file that could not be brewed never shows up on a home tile or in Home
+// Assistant; the curve the pump follows is left alone throughout.
+void scanRecipes()
+{
+  recipeCount = 0;
+  if (!sdReady)
+  {
+    return;
+  }
+
+  File dir = SD.open("/recipes");
+  if (!dir)
+  {
+    Serial.println("[SD] scanRecipes: cannot open /recipes");
+    return;
+  }
+
+  while (recipeCount < MAX_RECIPES)
+  {
+    File entry = dir.openNextFile();
+    if (!entry)
+    {
+      break;
+    }
+
+    String name = entry.name();
+    bool isDir = entry.isDirectory();
+    entry.close();
+
+    int slashIndex = name.lastIndexOf('/');
+    if (slashIndex >= 0)
+    {
+      name = name.substring(slashIndex + 1);
+    }
+    if (isDir || !name.endsWith(".csv"))
+    {
+      continue;
+    }
+
+    char stem[RECIPE_NAME_MAX_LEN];
+    if (!sanitizeRecipeStem(name.substring(0, name.length() - 4).c_str(), stem, sizeof(stem)))
+    {
+      Serial.print("[SD] scanRecipes: skipped '"); Serial.print(name);
+      Serial.println("' — file names may only use letters, digits, _ and -");
+      continue;
+    }
+
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "/recipes/%s.csv", stem);
+    resetRecipeScratch(stem);
+    if (!readSdTextFile(path, sdTextBuffer, sizeof(sdTextBuffer)) ||
+        !validateRecipeBody(sdTextBuffer))
+    {
+      Serial.print("[SD] scanRecipes: skipped unreadable recipe '"); Serial.print(name); Serial.println("'");
+      continue;
+    }
+
+    recipes[recipeCount++] = recipeScratch;
+  }
+  dir.close();
+
+  Serial.print("[SD] scanRecipes: found "); Serial.print(recipeCount); Serial.println(" recipes");
+}
+
+// Cheap fingerprint of what the recipes and home tiles show, so the periodic
+// rescan can tell whether anything on the card actually changed.
+uint32_t recipeLibrarySignature()
+{
+  uint32_t signature = 2166136261u;
+  auto mix = [&signature](const char *text) {
+    for (const char *c = text; *c != '\0'; c++)
+    {
+      signature = (signature ^ (uint8_t)*c) * 16777619u;
+    }
+    signature = (signature ^ 0xFFu) * 16777619u;
+  };
+
+  for (int i = 0; i < recipeCount; i++)
+  {
+    mix(recipes[i].stem);
+    mix(recipes[i].name);
+    mix(recipes[i].grind);
+    signature = signature * 31u + (uint32_t)(recipes[i].dose * 10.0f);
+    signature = signature * 31u + (uint32_t)(recipes[i].yield * 10.0f);
+    signature = signature * 31u + (uint32_t)(recipes[i].temp + 1);
+  }
+  for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
+  {
+    mix(homeSlotStems[slot]);
+  }
+  return signature;
+}
+
+// Loads a recipe's curve into the pump and makes it the active recipe, without
+// telling anyone: setup() uses this to restore the recipe from before the
+// power went, selectRecipe() to pick one.
+bool loadRecipe(const char *stem)
+{
+  if (!sdReady)
+  {
+    return false;
+  }
+
+  char wanted[RECIPE_NAME_MAX_LEN];
+  strncpy(wanted, stem, sizeof(wanted) - 1);
+  wanted[sizeof(wanted) - 1] = '\0';
+
+  char path[MAX_PATH_LEN];
+  snprintf(path, sizeof(path), "/recipes/%s.csv", wanted);
+  if (!readSdTextFile(path, sdTextBuffer, sizeof(sdTextBuffer)))
+  {
+    Serial.print("[RECIPE] Cannot read "); Serial.println(path);
+    return false;
+  }
+
+  // Parse straight into the live curve, keeping the old one to put back: a file
+  // that fails half way must not leave the pump following a mixture of the two.
   ProfilePoint previousPoints[MAX_PROFILE_POINTS];
   int previousCount = profilePointCount;
   memcpy(previousPoints, profilePoints, sizeof(previousPoints));
   profilePointCount = 0;
-  profileTargetWeightField = 0.0f;
+  resetRecipeScratch(wanted);
 
-  String header = f.readStringUntil('\n');
-  // Some editors write a UTF-8 byte-order mark. It is invisible, the old reader
-  // skipped the header line without looking at it so it never mattered, and the
-  // shipped blooming_espresso.csv has one — but it would defeat the format
-  // sniffing below and make the file unreadable.
-  if (header.length() >= 3 &&
-      (uint8_t)header.charAt(0) == 0xEF &&
-      (uint8_t)header.charAt(1) == 0xBB &&
-      (uint8_t)header.charAt(2) == 0xBF)
-  {
-    header.remove(0, 3);
-  }
-  header.trim();
-
-  bool ok;
-  if (isLegacyProfileHeader(header))
-  {
-    String row = f.readStringUntil('\n');
-    row.trim();
-    ok = parseLegacyProfileRow(row);
-    Serial.println("[SD] loadProfile: legacy 4-step format");
-  }
-  else
-  {
-    // In v2 the first line carries data like any other, so it is parsed here
-    // rather than skipped as a header.
-    ok = true;
-    String line = header;
-    while (line.length() > 0)
-    {
-      line.trim();
-      if (line.length() > 0 && line.charAt(0) != '#')
-      {
-        char buf[PROFILE_CSV_BUFFER_LEN];
-        line.toCharArray(buf, sizeof(buf));
-        if (!parseProfileV2Line(buf))
-        {
-          ok = false;
-          break;
-        }
-      }
-      line = f.readStringUntil('\n');
-    }
-
-    if (ok && profilePointCount < PROFILE_MIN_POINTS)
-    {
-      Serial.print("[SD] loadProfile: only "); Serial.print(profilePointCount);
-      Serial.println(" point(s) — not a usable profile");
-      ok = false;
-    }
-  }
-  f.close();
-
-  if (!ok)
+  if (!parseBodyLines(sdTextBuffer) || profilePointCount < PROFILE_MIN_POINTS)
   {
     memcpy(profilePoints, previousPoints, sizeof(profilePoints));
     profilePointCount = previousCount;
+    Serial.print("[RECIPE] Rejected "); Serial.println(path);
     return false;
   }
 
-  Serial.print("[SD] loadProfile: '"); Serial.print(activeProfileName);
+  activeRecipe = recipeScratch;
+
+  Serial.print("[RECIPE] Loaded '"); Serial.print(activeRecipe.name);
   Serial.print("' — "); Serial.print(profilePointCount);
   Serial.print(" points over "); Serial.print(profileTotalSeconds(), 1); Serial.println("s");
   return true;
+}
+
+// Sets the machine up for a recipe: its curve for the pump, its yield for the
+// weight cut-off. Picking a recipe is a request to brew by it, so brew by
+// recipe is switched on as well if it was off.
+bool selectRecipe(const char *stem)
+{
+  if (!loadRecipe(stem))
+  {
+    return false;
+  }
+
+  preferences.putString("recipe", activeRecipe.stem);
+  setRecipeMode(true);
+
+  updateBrewHeader();
+  writeRecipePanel();
+  homeSlotsUiDirty = true;
+  recipeStateDirty = true;
+  return true;
+}
+
+// Lets go of the active recipe. The machine then brews as a stock Mara X until
+// another recipe is picked.
+void clearActiveRecipe()
+{
+  if (!isRecipeActive())
+  {
+    return;
+  }
+
+  Serial.print("[RECIPE] '"); Serial.print(activeRecipe.name); Serial.println("' is no longer active");
+  memset(&activeRecipe, 0, sizeof(activeRecipe));
+  profilePointCount = 0;
+  preferences.remove("recipe");
+  updateBrewHeader();
+  writeRecipePanel();
+  homeSlotsUiDirty = true;
+  recipeStateDirty = true;
+}
+
+// Whether the next shot follows a recipe: brew by recipe is on and one is
+// picked. Everything that shapes a shot — the pump curve, the weight cut-off,
+// the preview — asks this rather than either half on its own.
+bool recipeInCharge()
+{
+  return recipeModeEnabled && isRecipeActive();
+}
+
+// The settings page's switch, and its twin in Home Assistant. The selected
+// recipe is kept either way, so switching back on returns to it.
+void setRecipeMode(bool enabled)
+{
+  if (enabled == recipeModeEnabled)
+  {
+    return;
+  }
+
+  recipeModeEnabled = enabled;
+  preferences.putBool("recipe_mode", enabled);
+  myNex.writeNum("recipeMode", enabled ? 1 : 0);
+  Serial.print("[RECIPE] Brew by recipe "); Serial.println(enabled ? "on" : "off");
+
+  updateBrewHeader();
+  writeRecipePanel();
+  homeSlotsUiDirty = true;
+  recipeStateDirty = true;
+}
+
+// The switch on the settings page was flipped.
+void handleRecipeModeTap()
+{
+  int requested = pendingRecipeModeTap;
+  if (requested < 0)
+  {
+    return;
+  }
+  pendingRecipeModeTap = -1;
+
+  // A shot that has started keeps the rules it started with.
+  if (brewActive)
+  {
+    myNex.writeNum("recipeMode", recipeModeEnabled ? 1 : 0);
+    return;
+  }
+  setRecipeMode(requested == 1);
+}
+
+// The brew-by-weight target for the next shot: the recipe's yield, or 0 — no
+// cut-off — when no recipe is in charge or it gives none.
+float activeTargetWeight()
+{
+  return recipeInCharge() ? activeRecipe.yield : 0.0f;
+}
+
+// The tile assignment from the card. A missing or unreadable file just means
+// no tiles.
+void loadHomeSlots()
+{
+  memset(homeSlotStems, 0, sizeof(homeSlotStems));
+  if (!sdReady)
+  {
+    return;
+  }
+
+  char text[RECIPE_HOME_SLOTS * RECIPE_NAME_MAX_LEN + 8];
+  if (!readSdTextFile(RECIPE_HOME_SLOTS_PATH, text, sizeof(text)))
+  {
+    return;
+  }
+  if (!parseHomeSlots(text))
+  {
+    Serial.println("[SD] " RECIPE_HOME_SLOTS_PATH " is malformed — no home tiles");
+    return;
+  }
+  memcpy(homeSlotStems, homeSlotScratch, sizeof(homeSlotStems));
+}
+
+static bool saveHomeSlots()
+{
+  char text[RECIPE_HOME_SLOTS * RECIPE_NAME_MAX_LEN + 8];
+  snprintf(text, sizeof(text), "%s,%s,%s\n",
+           homeSlotStems[0], homeSlotStems[1], homeSlotStems[2]);
+  return writeSdTextFile(RECIPE_HOME_SLOTS_PATH, text);
+}
+
+// The recipe on a home tile (0-based), or -1 when the tile is unused.
+static int homeSlotRecipeIndex(int slot)
+{
+  if (slot < 0 || slot >= RECIPE_HOME_SLOTS || homeSlotStems[slot][0] == '\0')
+  {
+    return -1;
+  }
+  return findRecipeIndex(homeSlotStems[slot]);
+}
+
+// Writes the home tiles r1..r3. The text and colours are sent whatever page is
+// open — the HMI keeps them if the tiles are vscope global — but `vis` only
+// works on the page that is loaded, so updateDisplay() calls this again each
+// time the home page opens. The home page's own Postinitialize script hides
+// an empty tile before this gets there; see doc/ui/recipes_display.md.
+void updateHomeSlotsUi()
+{
+  bool onHomePage = isHomePage(currentPageId);
+
+  for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
+  {
+    int index = homeSlotRecipeIndex(slot);
+    String tile = "r" + String(slot + 1);
+    String component = "home." + tile;
+
+    if (index >= 0)
+    {
+      char text[128];
+      buildHomeTileText(recipes[index], text, sizeof(text));
+      bool active = recipeInCharge() && strcmp(recipes[index].stem, activeRecipe.stem) == 0;
+
+      sendNextionCommand(component + ".txt=\"" + nextionEscapedText(text) + "\"");
+      sendNextionCommand(component + ".pco=" + String(active ? RECIPE_TILE_PCO_ACTIVE : RECIPE_TILE_PCO));
+      sendNextionCommand(component + ".bco=" + String(active ? RECIPE_TILE_BCO_ACTIVE : RECIPE_TILE_BCO));
+    }
+    else
+    {
+      sendNextionCommand(component + ".txt=\"\"");
+    }
+
+    if (onHomePage)
+    {
+      sendNextionCommand("vis " + tile + "," + String(index >= 0 ? 1 : 0));
+    }
+  }
+}
+
+// Fills in the recipe panel on the brew page: what to grind, how much to dose,
+// where the temperature switch should be, and the yield the shot will stop at.
+// With no recipe in charge every field shows a dash.
+//
+// The brew page's components are local to it, so this only lands while the
+// page is loaded. It is called on entering the page and whenever the recipe
+// or the mode changes; a missing component fails silently (bkcmd=0), so an HMI
+// without the panel just ignores it.
+void writeRecipePanel()
+{
+  char grams[12];
+  char dose[16] = "-";
+  char yieldText[16] = "-";
+  char ratio[16] = "-";
+  const char *grind = "-";
+  const char *temp = "-";
+
+  if (recipeInCharge())
+  {
+    if (activeRecipe.grind[0] != '\0')
+    {
+      grind = activeRecipe.grind;
+    }
+    temp = recipeTempLabel(activeRecipe.temp);
+    if (activeRecipe.dose > 0.0f)
+    {
+      formatGrams(activeRecipe.dose, grams, sizeof(grams));
+      snprintf(dose, sizeof(dose), "%s g", grams);
+    }
+    if (activeRecipe.yield > 0.0f)
+    {
+      formatGrams(activeRecipe.yield, grams, sizeof(grams));
+      snprintf(yieldText, sizeof(yieldText), "%s g", grams);
+    }
+    if (activeRecipe.dose > 0.0f && activeRecipe.yield > 0.0f)
+    {
+      snprintf(ratio, sizeof(ratio), "1:%.1f", activeRecipe.yield / activeRecipe.dose);
+    }
+  }
+
+  sendNextionCommand("rGrind.txt=\"" + nextionEscapedText(grind) + "\"");
+  sendNextionCommand("rDose.txt=\"" + String(dose) + "\"");
+  sendNextionCommand("rYield.txt=\"" + String(yieldText) + "\"");
+  sendNextionCommand("rRatio.txt=\"" + String(ratio) + "\"");
+  sendNextionCommand("rTemp.txt=\"" + String(temp) + "\"");
+}
+
+// The brew page's header: the recipe the shot will follow, or why none will.
+// `profileModetxt` is the global the brew page copies into its header when it
+// loads; `profileMode` is the header itself, for when the page is already
+// open.
+void updateBrewHeader()
+{
+  const char *header;
+  if (!recipeModeEnabled)
+  {
+    header = "Brew by recipe off";
+  }
+  else if (isRecipeActive())
+  {
+    header = activeRecipe.name;
+  }
+  else
+  {
+    header = "No recipe selected";
+  }
+
+  String text = nextionEscapedText(header);
+  sendNextionCommand("profileModetxt.txt=\"" + text + "\"");
+  sendNextionCommand("profileMode.txt=\"" + text + "\"");
+}
+
+// A tap on a home tile: set the machine up for that recipe and go straight to
+// the brew page, where the panel says what to do next.
+void handleHomeTileTap()
+{
+  int slot = pendingHomeTileTap;
+  if (slot == 0)
+  {
+    return;
+  }
+  pendingHomeTileTap = 0;
+
+  if (brewActive)
+  {
+    return;
+  }
+
+  int index = homeSlotRecipeIndex(slot - 1);
+  if (index < 0)
+  {
+    Serial.print("[RECIPE] Home tile "); Serial.print(slot); Serial.println(" has no recipe");
+    return;
+  }
+
+  if (!selectRecipe(recipes[index].stem))
+  {
+    return;
+  }
+
+  // The display runs commands in order, so the writes after `page brew` land
+  // on the freshly loaded brew page.
+  sendNextionCommand("page brew");
+  updateBrewHeader();
+  writeRecipePanel();
 }
 
 void startPendingObservation(float flowAtStop, float pressAtStop)
@@ -1810,11 +2209,17 @@ void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float
 
   f.print(millis());
   f.print(",");
-  f.print(activeProfileName);
+  // A recipe name is free text and may hold a comma, which would shift every
+  // column after it. A shot pulled without a recipe is logged as "-".
+  const char *recipeName = recipeInCharge() ? activeRecipe.name : "-";
+  for (const char *c = recipeName; *c != '\0'; c++)
+  {
+    f.print(*c == ',' ? ';' : *c);
+  }
   f.print(",");
   f.print(finalWeight, 2);
   f.print(",");
-  f.print(targetWeight, 2);
+  f.print(activeTargetWeight(), 2);
   f.print(",");
   f.print(brewTimeS);
   f.print(",");
@@ -1824,46 +2229,6 @@ void saveBrewLog(float finalWeight, int brewTimeS, float flow, float pres, float
   f.print(",");
   f.println(extra, 4);
   f.close();
-}
-
-void updateProfileModeText()
-{
-  static char lastProfileMode[PROFILE_NAME_MAX_LEN] = "";
-  const char* newMode;
-
-  if (pressureProfilingEnabled && remoteProfilingEnabled && sdReady)
-  {
-    newMode = activeProfileName;
-  }
-  else if (pressureProfilingEnabled)
-  {
-    newMode = "Manual";
-  }
-  else
-  {
-    newMode = "None";
-  }
-
-  myNex.writeStr("profileModetxt.txt", newMode);  // global var read by the brew page on Preinitialize
-
-  // profileMode.txt only exists on the brew page, so writing it while the
-  // profile list is open can only fail. Skip it: this runs on every display
-  // refresh, and UART2 time on that page is better spent on touch events.
-  if (!isProfileSelectionPage(currentPageId))
-  {
-    myNex.writeStr("profileMode.txt", newMode);  // direct write if currently on brew page
-  }
-
-  // Only log if mode actually changed
-  if (strcmp(newMode, lastProfileMode) != 0)
-  {
-    Serial.print("[DEBUG] Profile mode changed: ");
-    Serial.print(lastProfileMode);
-    Serial.print(" -> ");
-    Serial.println(newMode);
-    strncpy(lastProfileMode, newMode, sizeof(lastProfileMode) - 1);
-    lastProfileMode[sizeof(lastProfileMode) - 1] = '\0';
-  }
 }
 
 void updateScaleConnectionUi()
@@ -1893,7 +2258,7 @@ void updateScaleConnectionUi()
   // Directly update p3.pic on home page (pic 20=connected, 21=disconnected).
   // The cross-page write fails when the home page is not loaded; with bkcmd=0
   // (set in setup()) that failure is silent instead of returning a junk packet.
-  myNex.writeNum("home.p3.pic", connected ? 20 : 21);
+  myNex.writeNum("home.p3.pic", connected ? 19 : 20);
 
   lastScaleConnectedUi = connected;
   lastScaleConnectedUiWriteMs = now;
@@ -2020,44 +2385,22 @@ static bool publishHaEntity(const char *component,
   return ok;
 }
 
-// The profile picker. Its options are the profiles on the card, so unlike the
-// other entities this has to be re-announced whenever that list changes —
-// publishProfileState() calls it for exactly that reason.
-void publishHaProfileSelect()
+// The recipe picker. Its options are the files on the card, so
+// publishRecipeState() re-announces it whenever they change. The first option
+// lets go of the recipe.
+void publishHaRecipeSelect()
 {
-  String options = "";
-  int announced = 0;
-  for (int i = 0; i < profileCount && announced < PROFILE_SELECT_MAX_OPTIONS; i++)
+  String attributes = "\"name\":\"Recipe\",\"ic\":\"mdi:notebook-outline\","
+                      "\"cmd_t\":\"" recipe_select_topic "\",\"ops\":[\"" RECIPE_NONE_OPTION "\"";
+  for (int i = 0; i < recipeCount; i++)
   {
-    String stem = profileNames[i];
-    if (stem.endsWith(".csv"))
-    {
-      stem = stem.substring(0, stem.length() - 4);
-    }
-    if (options.length() > 0)
-    {
-      options += ",";
-    }
-    // Appended one piece at a time: on Arduino a bare string literal on the
-    // left of + is not a String concatenation.
-    options += "\"";
-    options += stem;
-    options += "\"";
-    announced++;
+    attributes += ",\"";
+    attributes += recipes[i].stem;
+    attributes += "\"";
   }
-
-  if (announced < profileCount)
-  {
-    Serial.print("[MQTT] Profile select truncated to "); Serial.print(announced);
-    Serial.print(" of "); Serial.print(profileCount); Serial.println(" profiles");
-  }
-
-  String attributes = "\"name\":\"Profile\",\"ic\":\"mdi:chart-bell-curve-cumulative\","
-                      "\"cmd_t\":\"" profile_select_topic "\",\"ops\":[";
-  attributes += options;
   attributes += "]";
 
-  publishHaEntity("select", "profile", profile_name_topic, attributes.c_str(), false);
+  publishHaEntity("select", "recipe", recipe_active_topic, attributes.c_str(), false);
 }
 
 // Re-announced on every reconnect: the payloads are retained, but republishing
@@ -2099,13 +2442,24 @@ void publishHaDiscovery()
                   "\"name\":\"Power\",\"dev_cla\":\"power\","
                   "\"pl_on\":\"1\",\"pl_off\":\"0\"", false);
 
-  // Every profile command is answered here, so a rejected edit is visible in
+  // Every recipe command is answered here, so a rejected edit is visible in
   // Home Assistant instead of only on the serial console.
-  publishHaEntity("sensor", "profile_result", profile_result_topic,
-                  "\"name\":\"Profile command result\",\"ent_cat\":\"diagnostic\","
+  publishHaEntity("sensor", "recipe_result", recipe_result_topic,
+                  "\"name\":\"Recipe command result\",\"ent_cat\":\"diagnostic\","
                   "\"ic\":\"mdi:message-alert-outline\"", false);
 
-  publishHaProfileSelect();
+  // The settings page's switch. Off, the machine brews as a stock Mara X.
+  publishHaEntity("switch", "recipe_mode", recipe_mode_topic,
+                  "\"name\":\"Brew by recipe\",\"ic\":\"mdi:notebook-check-outline\","
+                  "\"cmd_t\":\"" recipe_mode_set_topic "\"", false);
+
+  publishHaRecipeSelect();
+
+  // Profiles are gone. Their retained configs would otherwise keep two dead
+  // entities in Home Assistant for good; an empty retained message removes
+  // an entity announced by discovery.
+  mqttClient.publish(ha_discovery_prefix "/select/" ha_device_id "/profile/config", "", true);
+  mqttClient.publish(ha_discovery_prefix "/sensor/" ha_device_id "/profile_result/config", "", true);
 
   Serial.println("[MQTT] Home Assistant discovery published");
 }
@@ -2113,181 +2467,59 @@ void publishHaDiscovery()
 
 #ifndef DISABLE_WIFI_MQTT
 
-// Profile names become file names, so only characters that cannot escape the
-// /profiles directory are allowed. Rejecting '.' outright rules out '..' and
-// any extension games without needing to reason about path traversal.
-static bool sanitizeProfileStem(const char *raw, char *out, size_t outLen)
+static void publishCommandResult(const char *topic, const char *text)
 {
-  if (raw == NULL)
-  {
-    return false;
-  }
-
-  size_t length = strlen(raw);
-  // Room for the stem plus the ".csv" the caller appends.
-  if (length == 0 || length + 5 > outLen)
-  {
-    return false;
-  }
-
-  for (size_t i = 0; i < length; i++)
-  {
-    char c = raw[i];
-    bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '_' || c == '-';
-    if (!allowed)
-    {
-      return false;
-    }
-    out[i] = c;
-  }
-  out[length] = '\0';
-  return true;
-}
-
-// Serialises the loaded profile back into the v2 format — the same bytes that
-// are written to the card, so what Home Assistant edits is what is stored.
-void buildProfileCsv(String &out)
-{
-  out = "# marax profile v2\n";
-  out += "name,";
-  out += activeProfileName;
-  out += "\n";
-
-  if (profileTargetWeightField > 0.0f)
-  {
-    out += "target_weight,";
-    out += String(profileTargetWeightField, 1);
-    out += "\n";
-  }
-
-  for (int i = 0; i < profilePointCount; i++)
-  {
-    out += "point,";
-    out += String(profilePoints[i].seconds, 1);
-    out += ",";
-    out += String(profilePoints[i].bar, 1);
-    out += profilePoints[i].jump ? ",jump\n" : ",ramp\n";
-  }
-}
-
-// Parses a body with the real reader, then puts back whatever was loaded
-// before. Validating with the same code that will later read the file off the
-// card is the point: nothing can be accepted here and rejected on reload.
-static bool validateProfileBody(const char *body)
-{
-  ProfilePoint savedPoints[MAX_PROFILE_POINTS];
-  char savedName[PROFILE_NAME_MAX_LEN];
-  int savedCount = profilePointCount;
-  float savedWeight = profileTargetWeightField;
-  memcpy(savedPoints, profilePoints, sizeof(savedPoints));
-  strncpy(savedName, activeProfileName, sizeof(savedName));
-
-  profilePointCount = 0;
-  profileTargetWeightField = 0.0f;
-
-  bool ok = true;
-  const char *cursor = body;
-  char line[PROFILE_CSV_BUFFER_LEN];
-
-  while (*cursor != '\0' && ok)
-  {
-    size_t n = 0;
-    while (*cursor != '\0' && *cursor != '\n' && n < sizeof(line) - 1)
-    {
-      line[n++] = *cursor++;
-    }
-    // Ran out of buffer before the end of the line: malformed, not something
-    // to truncate silently.
-    if (*cursor != '\0' && *cursor != '\n')
-    {
-      ok = false;
-      break;
-    }
-    if (*cursor == '\n')
-    {
-      cursor++;
-    }
-    line[n] = '\0';
-
-    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t'))
-    {
-      line[--n] = '\0';
-    }
-
-    if (n == 0 || line[0] == '#')
-    {
-      continue;
-    }
-    if (!parseProfileV2Line(line))
-    {
-      ok = false;
-    }
-  }
-
-  if (ok && profilePointCount < PROFILE_MIN_POINTS)
-  {
-    ok = false;
-  }
-
-  memcpy(profilePoints, savedPoints, sizeof(profilePoints));
-  profilePointCount = savedCount;
-  profileTargetWeightField = savedWeight;
-  strncpy(activeProfileName, savedName, sizeof(activeProfileName));
-  return ok;
-}
-
-static bool writeProfileFile(const char *stem, const char *body)
-{
-  if (!SD.exists("/profiles"))
-  {
-    SD.mkdir("/profiles");
-  }
-
-  char path[MAX_PATH_LEN];
-  snprintf(path, sizeof(path), "/profiles/%s.csv", stem);
-
-  // On the ESP32 core FILE_WRITE is "w", so this replaces the file rather than
-  // appending to it.
-  File f = SD.open(path, FILE_WRITE);
-  if (!f)
-  {
-    Serial.print("[SD] writeProfileFile: cannot open "); Serial.println(path);
-    return false;
-  }
-
-  size_t expected = strlen(body);
-  size_t written = f.print(body);
-  // The reader takes a line at a time, so a body that does not end in a
-  // newline would lose its last point on the way back in.
-  if (expected > 0 && body[expected - 1] != '\n')
-  {
-    f.print('\n');
-  }
-  f.close();
-
-  if (written != expected)
-  {
-    Serial.print("[SD] writeProfileFile: short write to "); Serial.println(path);
-    return false;
-  }
-
-  Serial.print("[SD] writeProfileFile: wrote "); Serial.print(written);
-  Serial.print(" bytes to "); Serial.println(path);
-  return true;
-}
-
-static void publishProfileResult(const char *text)
-{
-  Serial.print("[MQTT] Profile command: "); Serial.println(text);
+  Serial.print("[MQTT] "); Serial.print(topic); Serial.print(": "); Serial.println(text);
   // Not retained: this is the answer to one command, not a state a fresh
   // subscriber should be handed on connect.
-  mqttClient.publish(profile_result_topic, text, false);
+  mqttClient.publish(topic, text, false);
 }
 
-// Refreshes the retained profile topics. Called from the main loop whenever
-// profileStateDirty is set, so callers only have to flag the change.
-void publishProfileState()
+static void publishRecipeResult(const char *text)
+{
+  publishCommandResult(recipe_result_topic, text);
+}
+
+// Publishes one SD file, as it is on the card, on `<topicPrefix><stem>`,
+// retained. An empty retained message would delete the topic instead, so a
+// file that cannot be read is skipped and logged rather than published blank.
+static void publishSdFileBody(const char *directory, const char *stem, const char *topicPrefix)
+{
+  char path[MAX_PATH_LEN];
+  snprintf(path, sizeof(path), "%s/%s.csv", directory, stem);
+  if (!readSdTextFile(path, sdTextBuffer, sizeof(sdTextBuffer)) || sdTextBuffer[0] == '\0')
+  {
+    Serial.print("[MQTT] Not publishing "); Serial.print(path); Serial.println(" — unreadable or empty");
+    return;
+  }
+
+  String topic = String(topicPrefix) + stem;
+  if (!mqttClient.publish(topic.c_str(), sdTextBuffer, true))
+  {
+    Serial.print("[MQTT] "); Serial.print(topic); Serial.println(" did not fit the buffer");
+  }
+}
+
+// Clears a retained body topic after its file was deleted.
+static void clearPublishedBody(const char *topicPrefix, const char *stem)
+{
+  String topic = String(topicPrefix) + stem;
+  mqttClient.publish(topic.c_str(), "", true);
+}
+
+void publishRecipeLibrary()
+{
+  for (int i = 0; i < recipeCount; i++)
+  {
+    publishSdFileBody("/recipes", recipes[i].stem, recipe_body_prefix);
+  }
+}
+
+// Refreshes the retained recipe topics: the list, the active recipe, the home
+// tiles and the mode. The list is the authority on what exists — a body left retained
+// on the broker after its file was removed from the card by hand is ignored by
+// anything that checks it against this.
+void publishRecipeState()
 {
   if (!mqttClient.connected())
   {
@@ -2295,57 +2527,205 @@ void publishProfileState()
   }
 
   String list = "";
-  for (int i = 0; i < profileCount; i++)
+  for (int i = 0; i < recipeCount; i++)
   {
-    String stem = profileNames[i];
-    if (stem.endsWith(".csv"))
-    {
-      stem = stem.substring(0, stem.length() - 4);
-    }
     if (list.length() > 0)
     {
       list += ",";
     }
-    list += stem;
+    list += recipes[i].stem;
   }
+  mqttClient.publish(recipe_list_topic, list.c_str(), true);
+  mqttClient.publish(recipe_active_topic, isRecipeActive() ? activeRecipe.stem : RECIPE_NONE_OPTION, true);
 
-  mqttClient.publish(profile_list_topic, list.c_str(), true);
-  mqttClient.publish(profile_name_topic, activeProfileFileStem, true);
-
-  String csv;
-  buildProfileCsv(csv);
-  if (!mqttClient.publish(profile_active_topic, csv.c_str(), true))
+  String home = "";
+  for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
   {
-    Serial.print("[MQTT] Active profile body did not fit the buffer (");
-    Serial.print(csv.length()); Serial.println(" bytes)");
+    if (slot > 0)
+    {
+      home += ",";
+    }
+    home += homeSlotStems[slot];
   }
+  mqttClient.publish(recipe_home_topic, home.c_str(), true);
+  mqttClient.publish(recipe_mode_topic, recipeModeEnabled ? "ON" : "OFF", true);
 
 #ifdef ENABLE_HA_DISCOVERY
-  publishHaProfileSelect();
+  publishHaRecipeSelect();
 #endif
 }
 
-// Finds a profile by stem in the scanned list. Returns -1 when it is not there.
-static int findProfileIndex(const char *stem)
+// The body of processPendingRecipeCommand(), which has already made sure there
+// is no shot running and a card to write to.
+static void processRecipeCommand()
 {
-  char wanted[PROFILE_NAME_MAX_LEN];
-  snprintf(wanted, sizeof(wanted), "%s.csv", stem);
-  for (int i = 0; i < profileCount; i++)
+  RecipeCommandKind kind = pendingRecipeCommand.kind;
+  char stem[RECIPE_NAME_MAX_LEN];
+  char message[96];
+
+  if (kind == RECIPE_CMD_SELECT)
   {
-    if (strcmp(profileNames[i], wanted) == 0)
+    // For select the stem arrives as the payload, not in the topic.
+    const char *payload = pendingRecipeCommand.body;
+    if (payload[0] == '\0' || strcmp(payload, RECIPE_NONE_OPTION) == 0)
     {
-      return i;
+      clearActiveRecipe();
+      publishRecipeResult("ok: no recipe active");
+      recipeStateDirty = true;
+    }
+    else if (!sanitizeRecipeStem(payload, stem, sizeof(stem)))
+    {
+      publishRecipeResult("error: invalid recipe name");
+    }
+    else if (findRecipeIndex(stem) < 0)
+    {
+      snprintf(message, sizeof(message), "error: no recipe '%s'", stem);
+      publishRecipeResult(message);
+    }
+    else if (!selectRecipe(stem))
+    {
+      snprintf(message, sizeof(message), "error: could not load '%s'", stem);
+      publishRecipeResult(message);
+    }
+    else
+    {
+      snprintf(message, sizeof(message), "ok: selected '%s'", stem);
+      publishRecipeResult(message);
     }
   }
-  return -1;
+  else if (kind == RECIPE_CMD_SAVE)
+  {
+    char path[MAX_PATH_LEN];
+    if (!sanitizeRecipeStem(pendingRecipeCommand.stem, stem, sizeof(stem)))
+    {
+      publishRecipeResult("error: invalid recipe name");
+      return;
+    }
+
+    resetRecipeScratch(stem);
+    snprintf(path, sizeof(path), "/recipes/%s.csv", stem);
+    if (!validateRecipeBody(pendingRecipeCommand.body))
+    {
+      publishRecipeResult("error: recipe body rejected by the parser");
+    }
+    else if (findRecipeIndex(stem) < 0 && recipeCount >= MAX_RECIPES)
+    {
+      publishRecipeResult("error: the card already holds the most recipes the controller can list");
+    }
+    else if (!writeSdTextFile(path, pendingRecipeCommand.body))
+    {
+      publishRecipeResult("error: could not write to the SD card");
+    }
+    else
+    {
+      scanRecipes();
+
+      // Editing the selected recipe takes effect straight away. loadRecipe()
+      // rather than selectRecipe(): saving is not a request to switch brew by
+      // recipe back on.
+      if (isRecipeActive() && strcmp(stem, activeRecipe.stem) == 0 && loadRecipe(stem))
+      {
+        updateBrewHeader();
+        writeRecipePanel();
+      }
+
+      publishSdFileBody("/recipes", stem, recipe_body_prefix);
+      homeSlotsUiDirty = true;
+      recipeStateDirty = true;
+      snprintf(message, sizeof(message), "ok: saved '%s'", stem);
+      publishRecipeResult(message);
+    }
+  }
+  else if (kind == RECIPE_CMD_DELETE)
+  {
+    char path[MAX_PATH_LEN];
+    if (!sanitizeRecipeStem(pendingRecipeCommand.stem, stem, sizeof(stem)))
+    {
+      publishRecipeResult("error: invalid recipe name");
+      return;
+    }
+
+    snprintf(path, sizeof(path), "/recipes/%s.csv", stem);
+    if (findRecipeIndex(stem) < 0)
+    {
+      snprintf(message, sizeof(message), "error: no recipe '%s'", stem);
+      publishRecipeResult(message);
+    }
+    else if (!SD.remove(path))
+    {
+      publishRecipeResult("error: could not delete the file");
+    }
+    else
+    {
+      // The selected recipe may go too: the machine then has none, as if it
+      // had been cleared, rather than pointing at a file that is gone.
+      if (isRecipeActive() && strcmp(stem, activeRecipe.stem) == 0)
+      {
+        clearActiveRecipe();
+      }
+
+      bool slotsChanged = false;
+      for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
+      {
+        if (strcmp(homeSlotStems[slot], stem) == 0)
+        {
+          homeSlotStems[slot][0] = '\0';
+          slotsChanged = true;
+        }
+      }
+      if (slotsChanged)
+      {
+        saveHomeSlots();
+      }
+
+      scanRecipes();
+      clearPublishedBody(recipe_body_prefix, stem);
+      homeSlotsUiDirty = true;
+      recipeStateDirty = true;
+      snprintf(message, sizeof(message), "ok: deleted '%s'", stem);
+      publishRecipeResult(message);
+    }
+  }
+  else if (kind == RECIPE_CMD_HOME)
+  {
+    if (!parseHomeSlots(pendingRecipeCommand.body))
+    {
+      publishRecipeResult("error: home tiles must be up to three recipe names, comma separated");
+      return;
+    }
+
+    for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
+    {
+      if (homeSlotScratch[slot][0] != '\0' && findRecipeIndex(homeSlotScratch[slot]) < 0)
+      {
+        snprintf(message, sizeof(message), "error: no recipe '%s'", homeSlotScratch[slot]);
+        publishRecipeResult(message);
+        return;
+      }
+    }
+
+    memcpy(homeSlotStems, homeSlotScratch, sizeof(homeSlotStems));
+    if (!saveHomeSlots())
+    {
+      publishRecipeResult("error: could not write to the SD card");
+    }
+    else
+    {
+      publishRecipeResult("ok: home tiles updated");
+    }
+    // Even after a failed write the tiles show the new assignment until the
+    // next reboot, so say so rather than pretend nothing changed.
+    homeSlotsUiDirty = true;
+    recipeStateDirty = true;
+  }
 }
 
 // Carries out whatever the MQTT callback recorded. Runs from the main loop so
 // the SD card is only touched at a moment of our choosing.
-void processPendingProfileCommand()
+void processPendingRecipeCommand()
 {
-  ProfileCommandKind kind = pendingProfileCommand.kind;
-  if (kind == PROFILE_CMD_NONE)
+  RecipeCommandKind kind = pendingRecipeCommand.kind;
+  if (kind == RECIPE_CMD_NONE)
   {
     return;
   }
@@ -2353,134 +2733,54 @@ void processPendingProfileCommand()
   if (!mqttClient.connected())
   {
     // Nowhere to report the outcome; drop it rather than acting unannounced.
-    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    pendingRecipeCommand.kind = RECIPE_CMD_NONE;
     return;
   }
 
-  if (kind == PROFILE_CMD_TOO_LARGE)
+  if (kind == RECIPE_CMD_TOO_LARGE)
   {
-    publishProfileResult("error: profile body too large");
-    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    publishRecipeResult("error: body too large");
+    pendingRecipeCommand.kind = RECIPE_CMD_NONE;
     return;
   }
 
-  // Never write to the card or change the running profile mid-shot. Refusing
-  // outright is clearer than queueing the command to land seconds later.
+  // Never write to the card or change what the pump follows mid-shot.
+  // Refusing outright is clearer than queueing the command to land seconds
+  // later.
   if (brewActive)
   {
-    publishProfileResult("error: brew in progress");
-    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    publishRecipeResult("error: brew in progress");
+    pendingRecipeCommand.kind = RECIPE_CMD_NONE;
+    return;
+  }
+
+  // The mode lives in NVS, so it works without a card.
+  if (kind == RECIPE_CMD_MODE)
+  {
+    const char *payload = pendingRecipeCommand.body;
+    if (strcmp(payload, "ON") == 0 || strcmp(payload, "OFF") == 0)
+    {
+      setRecipeMode(strcmp(payload, "ON") == 0);
+      publishRecipeResult(recipeModeEnabled ? "ok: brew by recipe on" : "ok: brew by recipe off");
+    }
+    else
+    {
+      publishRecipeResult("error: brew by recipe takes ON or OFF");
+    }
+    recipeStateDirty = true;
+    pendingRecipeCommand.kind = RECIPE_CMD_NONE;
     return;
   }
 
   if (!sdReady)
   {
-    publishProfileResult("error: no SD card");
-    pendingProfileCommand.kind = PROFILE_CMD_NONE;
+    publishRecipeResult("error: no SD card");
+    pendingRecipeCommand.kind = RECIPE_CMD_NONE;
     return;
   }
 
-  char stem[PROFILE_NAME_MAX_LEN];
-  char message[96];
-
-  if (kind == PROFILE_CMD_SELECT)
-  {
-    // For select the stem arrives as the payload, not in the topic.
-    if (!sanitizeProfileStem(pendingProfileCommand.body, stem, sizeof(stem)))
-    {
-      publishProfileResult("error: invalid profile name");
-    }
-    else
-    {
-      int index = findProfileIndex(stem);
-      if (index < 0)
-      {
-        snprintf(message, sizeof(message), "error: no profile '%s'", stem);
-        publishProfileResult(message);
-      }
-      else if (!selectProfile(index))
-      {
-        snprintf(message, sizeof(message), "error: could not load '%s'", stem);
-        publishProfileResult(message);
-      }
-      else
-      {
-        snprintf(message, sizeof(message), "ok: selected '%s'", stem);
-        publishProfileResult(message);
-      }
-    }
-  }
-  else if (kind == PROFILE_CMD_SAVE)
-  {
-    if (!sanitizeProfileStem(pendingProfileCommand.stem, stem, sizeof(stem)))
-    {
-      publishProfileResult("error: invalid profile name");
-    }
-    else if (!validateProfileBody(pendingProfileCommand.body))
-    {
-      publishProfileResult("error: profile body rejected by the parser");
-    }
-    else if (!writeProfileFile(stem, pendingProfileCommand.body))
-    {
-      publishProfileResult("error: could not write to the SD card");
-    }
-    else
-    {
-      scanProfiles();
-      lastProfileScanMs = millis();
-
-      // Editing the profile that is loaded should take effect straight away.
-      if (strcmp(stem, activeProfileFileStem) == 0)
-      {
-        int index = findProfileIndex(stem);
-        if (index >= 0)
-        {
-          selectProfile(index);
-        }
-      }
-
-      profileStateDirty = true;
-      snprintf(message, sizeof(message), "ok: saved '%s'", stem);
-      publishProfileResult(message);
-    }
-  }
-  else if (kind == PROFILE_CMD_DELETE)
-  {
-    if (!sanitizeProfileStem(pendingProfileCommand.stem, stem, sizeof(stem)))
-    {
-      publishProfileResult("error: invalid profile name");
-    }
-    else if (strcmp(stem, activeProfileFileStem) == 0)
-    {
-      // Deleting the loaded profile would leave the pump following something
-      // with no file behind it, and the picker pointing at a name that is gone.
-      publishProfileResult("error: select another profile first");
-    }
-    else if (findProfileIndex(stem) < 0)
-    {
-      snprintf(message, sizeof(message), "error: no profile '%s'", stem);
-      publishProfileResult(message);
-    }
-    else
-    {
-      char path[MAX_PATH_LEN];
-      snprintf(path, sizeof(path), "/profiles/%s.csv", stem);
-      if (!SD.remove(path))
-      {
-        publishProfileResult("error: could not delete the file");
-      }
-      else
-      {
-        scanProfiles();
-        lastProfileScanMs = millis();
-        profileStateDirty = true;
-        snprintf(message, sizeof(message), "ok: deleted '%s'", stem);
-        publishProfileResult(message);
-      }
-    }
-  }
-
-  pendingProfileCommand.kind = PROFILE_CMD_NONE;
+  processRecipeCommand();
+  pendingRecipeCommand.kind = RECIPE_CMD_NONE;
 }
 #endif
 
@@ -2512,85 +2812,20 @@ void tryReconnectMqtt()
   {
     mqttClient.publish(availability_topic, "online", true);
 
-    mqttClient.subscribe(profile_select_topic);
-    mqttClient.subscribe(profile_save_prefix "+");
-    mqttClient.subscribe(profile_delete_prefix "+");
-    // The retained profile topics are refreshed from the main loop.
-    profileStateDirty = true;
+    mqttClient.subscribe(recipe_select_topic);
+    mqttClient.subscribe(recipe_home_set_topic);
+    mqttClient.subscribe(recipe_mode_set_topic);
+    mqttClient.subscribe(recipe_save_prefix "+");
+    mqttClient.subscribe(recipe_delete_prefix "+");
+    // The retained topics are refreshed from the main loop.
+    recipeStateDirty = true;
+    recipeLibraryDirty = true;
 
 #ifdef ENABLE_HA_DISCOVERY
     publishHaDiscovery();
 #endif
   }
 #endif
-}
-
-void scanProfiles()
-{
-  profileCount = 0;
-  profileListStr = "";
-
-  if (!sdReady)
-  {
-    Serial.println("[SD] scanProfiles: sdReady=false — skipping");
-    return;
-  }
-
-  Serial.println("[SD] scanProfiles: opening /profiles");
-  File dir = SD.open("/profiles");
-  if (!dir)
-  {
-    Serial.println("[SD] scanProfiles: FAILED to open /profiles directory");
-    return;
-  }
-  Serial.println("[SD] scanProfiles: directory opened OK");
-
-  int skipped = 0;
-  while (profileCount < MAX_PROFILES)
-  {
-    File entry = dir.openNextFile();
-    if (!entry)
-    {
-      break;
-    }
-
-    String rawName = entry.name();
-    bool isDir = entry.isDirectory();
-    Serial.print("[SD] scanProfiles: entry='" ); Serial.print(rawName);
-    Serial.print("' isDir="); Serial.println(isDir);
-
-    if (!isDir)
-    {
-      String name = rawName;
-      int slashIndex = name.lastIndexOf('/');
-      if (slashIndex >= 0)
-      {
-        name = name.substring(slashIndex + 1);
-      }
-
-      if (name.endsWith(".csv"))
-      {
-        name.toCharArray(profileNames[profileCount], sizeof(profileNames[profileCount]));
-        profileNames[profileCount][sizeof(profileNames[profileCount]) - 1] = '\0';
-        if (profileListStr.length() > 0)
-        {
-          profileListStr += ",";
-        }
-        profileListStr += name.substring(0, name.length() - 4);
-        Serial.print("[SD] scanProfiles: added profile '"); Serial.print(profileNames[profileCount]); Serial.println("'");
-        profileCount++;
-      }
-      else
-      {
-        Serial.print("[SD] scanProfiles: skipped (not .csv): "); Serial.println(name);
-        skipped++;
-      }
-    }
-    entry.close();
-  }
-  dir.close();
-  Serial.print("[SD] scanProfiles: done — found "); Serial.print(profileCount);
-  Serial.print(" profiles, skipped "); Serial.println(skipped);
 }
 
 void updateScale()
@@ -2785,11 +3020,31 @@ float getPressure()
 // This deliberately does not use EasyNextionLibrary's readNumber(): that one
 // begins by discarding every byte already in the RX buffer that is not part of
 // its own '#' custom protocol — touch events included — and then scans past
-// anything that is not 0x71, so a profile selection made while a read was in
-// flight was silently thrown away. Going through nextionProcessRx() keeps
-// touch events queued while we wait for the reply.
+// anything that is not 0x71, so a tile tap made while a read was in flight
+// would be silently thrown away. Going through nextionProcessRx() keeps it
+// while we wait for the reply.
 bool readNextionNumber(const char *component, uint32_t &value)
 {
+  // A previous `get` gave up waiting. Its answer may still be on its way, and
+  // it would look exactly like the answer to this one, so give it a moment to
+  // turn up and throw it away before asking for anything else. Without this
+  // every read after a single timeout is shifted by one component — the page
+  // id would report the page before last.
+  if (nextionReadDesynced)
+  {
+    uint32_t stale = 0;
+    unsigned long drainStartMs = millis();
+    while (millis() - drainStartMs < NEXTION_RESYNC_DRAIN_MS)
+    {
+      if (nextionProcessRx(&stale))
+      {
+        break;  // that was the late answer — discarded
+      }
+      delay(1);
+    }
+    nextionReadDesynced = false;
+  }
+
   // Clear anything already pending (touches are kept) so a late reply to an
   // earlier `get` cannot be mistaken for the answer to this one.
   nextionProcessRx(NULL);
@@ -2808,106 +3063,32 @@ bool readNextionNumber(const char *component, uint32_t &value)
     delay(1);  // yield to FreeRTOS instead of spinning on the UART
   }
 
+  nextionReadDesynced = true;
   return false;
 }
 
-// Reads one manual-mode profile pressure from the display. Values outside the
-// sensor range are treated as garbled and leave the current value alone.
-void readManualProfilePressure(const char *component, int &pressureBar)
+// Picks up recipes changed straight on the card. Compared by content rather
+// than count: an edit to a file changes what a home tile should say. Held
+// back during and just after a shot, when the SD card and the loop have
+// better things to do.
+void rescanRecipes()
 {
-  uint32_t value = 0;
-  if (!readNextionNumber(component, value) || value > MANUAL_PRESSURE_MAX_BAR)
+  if (!sdReady || brewActive || pendingObservation ||
+      millis() - lastRecipeScanMs < RECIPE_SCAN_INTERVAL_MS)
   {
     return;
   }
-  pressureBar = (int)value;
-}
+  lastRecipeScanMs = millis();
 
-// Reads one manual-mode segment duration from the display, with the same
-// guard against failed reads.
-void readManualProfileTime(const char *component, int &segmentSeconds)
-{
-  uint32_t value = 0;
-  if (!readNextionNumber(component, value) || value > MANUAL_SEGMENT_MAX_SECONDS)
+  uint32_t recipesBefore = recipeLibrarySignature();
+  scanRecipes();
+  loadHomeSlots();
+  if (recipeLibrarySignature() != recipesBefore)
   {
-    return;
-  }
-  segmentSeconds = (int)value;
-}
-
-void readSettigs()
-{
-  if ((millis() - readSettigsRefreshTimer > 4000) && !brewActive && !pendingObservation)
-  {
-    if (sdReady && (millis() - lastProfileScanMs >= PROFILE_SCAN_INTERVAL_MS))
-    {
-      int previousProfileCount = profileCount;
-      scanProfiles();
-      lastProfileScanMs = millis();
-      if (previousProfileCount != profileCount)
-      {
-        Serial.print("[DEBUG] Profile count changed: "); Serial.print(previousProfileCount);
-        Serial.print(" -> "); Serial.println(profileCount);
-        populateProfileList();
-      }
-    }
-
-    getPressure();
-    
-    // Read Nextion variables (only log if values change)
-    static int lastPPEnabled = -1;
-    static int lastRemoteEnabled = -1;
-    
-    // A failed read must not silently switch profiling on: readNextionNumber()
-    // rejects the sentinel, and only 0/1 are accepted as real answers.
-    uint32_t rawPP = 0;
-    if (readNextionNumber("pPEnabled", rawPP) && rawPP <= 1)
-    {
-      pressureProfilingEnabled = (rawPP != 0);
-    }
-    uint32_t rawRemote = 0;
-    if (readNextionNumber("remoteEnabled", rawRemote) && rawRemote <= 1)
-    {
-      remoteProfilingEnabled = (rawRemote != 0);
-    }
-    
-    // Only log if settings actually changed
-    if (pressureProfilingEnabled != lastPPEnabled || 
-        remoteProfilingEnabled != lastRemoteEnabled)
-    {
-      Serial.print("[DEBUG] Settings changed - pPEnabled:"); Serial.print(pressureProfilingEnabled);
-      Serial.print(" remoteEnabled:"); Serial.println(remoteProfilingEnabled);
-      
-      lastPPEnabled = pressureProfilingEnabled;
-      lastRemoteEnabled = remoteProfilingEnabled;
-    }
-    
-    // Manual mode (pressure profiling ON, remote OFF): read manual pressure settings.
-    // Every value is checked for the failure sentinel and range-checked before
-    // it is applied — a single dropped display response must not corrupt the
-    // profile that pressureProfile() is running.
-    if (!remoteProfilingEnabled && pressureProfilingEnabled)
-    {
-      readManualProfilePressure("t1p", t1p);
-      readManualProfilePressure("t2p", t2p);
-      readManualProfilePressure("t3p", t3p);
-      readManualProfilePressure("t4p", t4p);
-
-      readManualProfileTime("t1t", t1t);
-      readManualProfileTime("t2t", t2t);
-      readManualProfileTime("t3t", t3t);
-      readManualProfileTime("t4t", t4t);
-
-      // The pump follows profilePoints[] whatever the source, so the four
-      // display fields are folded into the same representation.
-      applyManualStepsToProfile();
-    }
-    
-    // targetWeight is authoritative from display input when available.
-    syncTargetWeightFromDisplay();
-
-    updateProfileModeText();
-    readSettigsRefreshTimer = millis();
+    Serial.println("[DEBUG] Recipes on the card changed");
+    homeSlotsUiDirty = true;
+    recipeStateDirty = true;
+    recipeLibraryDirty = true;
   }
 }
 
@@ -2943,33 +3124,39 @@ void updateDisplay()
     // Send updated values to display (no debug spam)
     myNex.writeNum("brewTemp", brewTemp);
     myNex.writeNum("steamTemp", steamTemp);
-    myNex.writeStr("actProfile.txt", activeProfileName);
-    updateProfileModeText();
-    
+    // The settings page copies this into its switch when it opens. Re-sent on
+    // every refresh because the display restarts with the ESP32 and would
+    // otherwise show its HMI default until the switch is next flipped.
+    myNex.writeNum("recipeMode", recipeModeEnabled ? 1 : 0);
+
     updateScaleConnectionUi();
 
     // Keep the previous page id when the display does not answer, rather than
     // letting the failure sentinel masquerade as a page change.
     readNextionNumber("dp", currentPageId);
 
-    if (isProfileSelectionPage(currentPageId))
-    {
-      // Keep MCU targetWeight synchronized from profile page selector.
-      syncTargetWeightFromDisplay();
-      updateTargetWeightUi(false);
-    }
-
     if (currentPageId != lastPageId)
     {
-      if (isProfileSelectionPage(currentPageId))
-      {
-        profilePageNeedsPopulate = true;
-      }
       if (isBrewPage(currentPageId))
       {
         brewPreviewNeedsDraw = true;
+        updateBrewHeader();
+        writeRecipePanel();
+      }
+      if (isHomePage(currentPageId))
+      {
+        homeSlotsUiDirty = true;
       }
       lastPageId = currentPageId;
+    }
+
+    // Sent on any page, not just the home page: with the tiles vscope global
+    // the text lands wherever the display is, so a wrong HOME_PAGE_ID costs
+    // only the show/hide, not the tiles' content.
+    if (homeSlotsUiDirty)
+    {
+      updateHomeSlotsUi();
+      homeSlotsUiDirty = false;
     }
 
     // The preview is only ever drawn while idle: once a shot is running the
@@ -2977,7 +3164,9 @@ void updateDisplay()
     // on screen until the page is left and re-entered.
     if (isBrewPage(currentPageId))
     {
-      uint32_t signature = profileSegmentSignature();
+      // Switching brew by recipe off or on changes what the preview should
+      // show without changing the curve itself.
+      uint32_t signature = profileSegmentSignature() * 2u + (recipeInCharge() ? 1u : 0u);
       if (signature != lastPreviewSignature)
       {
         lastPreviewSignature = signature;
@@ -2991,31 +3180,18 @@ void updateDisplay()
       }
     }
 
-    if (profilePageNeedsPopulate &&
-        isProfileSelectionPage(currentPageId))
-    {
-      populateProfileList();
-      profilePageNeedsPopulate = false;
-    }
+    myNex.writeNum("tarsteam.val", steamTargetTemp);
+    myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
+    myNex.writeNum("heatingel.val", heatingElementOn);
 
-    // These are home-page components: writing them while the profile list is
-    // open can only fail, so skip the traffic on the page where touch latency
-    // matters. Every other page still gets them unconditionally.
-    if (!isProfileSelectionPage(currentPageId))
-    {
-      myNex.writeNum("tarsteam.val", steamTargetTemp);
-      myNex.writeNum("fastheattimer.val", fastHeatingCountDown);
-      myNex.writeNum("heatingel.val", heatingElementOn);
-    }
-
-    // Read settings (except while the brew page is open)
     if (!isBrewPage(currentPageId))
     {
-      readSettigs();
+      rescanRecipes();
     }
 
     // Check if we're on cleaning page
-    if (currentPageId == 4278190086 || currentPageId == 6)
+    if (currentPageId == (uint32_t)CLEANING_PAGE_ID ||
+        currentPageId == (uint32_t)(0xFF000000 | CLEANING_PAGE_ID))
     {
       cleaningModeActive = true;
     }
@@ -3202,30 +3378,8 @@ float profileTargetPressureAt(float second)
   return profilePoints[profilePointCount - 1].bar;
 }
 
-// Converts the display's four manual steps into the polyline the pump follows.
-// Each step holds its pressure for its own duration, so every point is a jump —
-// which is exactly the staircase manual mode has always produced.
-void applyManualStepsToProfile()
-{
-  const int pressures[4] = { t1p, t2p, t3p, t4p };
-  const int durations[4] = { t1t, t2t, t3t, t4t };
-
-  profilePointCount = 0;
-  profilePoints[profilePointCount++] = { 0.0f, (float)pressures[0], false };
-
-  float elapsed = 0.0f;
-  for (int i = 0; i < 4; i++)
-  {
-    elapsed += (float)durations[i];
-    // The pressure of the *next* step starts where this one ends; the last
-    // step holds its own pressure to the end of the profile.
-    float bar = (float)((i < 3) ? pressures[i + 1] : pressures[3]);
-    profilePoints[profilePointCount++] = { elapsed, bar, true };
-  }
-}
-
-// Cheap fingerprint of the polyline, used to notice that a different profile
-// was loaded — or a manual value edited — while the brew page is open. Times
+// Cheap fingerprint of the polyline, used to notice that a different recipe
+// was loaded — or the active one edited — while the brew page is open. Times
 // and pressures are folded in at their 0.1 resolution.
 uint32_t profileSegmentSignature()
 {
@@ -3261,10 +3415,10 @@ void writeSetBarValue(int wave)
   myNex.writeNum("setbar.val", wave);
 }
 
-// Draws the whole target curve of the active profile into the brew page's
+// Draws the whole target curve of the active recipe into the brew page's
 // waveform, so the shape of the shot is visible before the lever is pulled.
-// The profile is spread across the full width of the graph, so the preview
-// always fills it regardless of how long the profile runs.
+// The curve is spread across the full width of the graph, so the preview
+// always fills it regardless of how long the curve runs.
 //
 // Two details make this work:
 //   * The HMI's own timers (`waveTimer`, `tm0`) call `add` on the waveform
@@ -3283,7 +3437,7 @@ bool drawTargetProfilePreview()
   sendNextionCommand("cle " + String(BREW_WAVEFORM_ID) + ",255");
 
   float totalSeconds = profileTotalSeconds();
-  if (!pressureProfilingEnabled || totalSeconds <= 0.0f)
+  if (!recipeInCharge() || totalSeconds <= 0.0f)
   {
     // Nothing configured to show — an empty graph is the honest answer.
     return true;
@@ -3314,7 +3468,7 @@ bool drawTargetProfilePreview()
     return false;
   }
 
-  Serial.print("[DISPLAY] Profile preview drawn: "); Serial.print(activeProfileName);
+  Serial.print("[DISPLAY] Curve preview drawn: "); Serial.print(activeRecipe.name);
   Serial.print(" over "); Serial.print(totalSeconds, 1); Serial.print("s, ");
   Serial.print(profilePointCount); Serial.println(" points");
   return true;
@@ -3322,8 +3476,12 @@ bool drawTargetProfilePreview()
 
 void pressureProfile()
 {
-  if (brewActive && pressureProfilingEnabled)
+  // Without a recipe in charge the pump stays at the full power brewDetect()
+  // gave it and nothing cuts the shot: the machine brews as a stock Mara X.
+  if (brewActive && recipeInCharge())
   {
+    float targetWeight = activeTargetWeight();
+
     // Brew-by-weight auto-stop is only valid when a scale is connected and
     // we have received at least one weight sample in this session.
     bool brewByWeightActive =
@@ -3359,13 +3517,13 @@ void pressureProfile()
       }
     }
 
-    // Safety: a profile with no duration is not configured. Skip profiling so
-    // the pump is not silently killed. This is checked after the weight cut-off
-    // above so brew-by-weight still stops the shot when no profile is loaded.
+    // Safety: a curve with no duration is not usable. Skip it so the pump is
+    // not silently killed. This is checked after the weight cut-off above so
+    // brew-by-weight still stops the shot either way.
     float totalProfileSeconds = profileTotalSeconds();
     if (totalProfileSeconds <= 0.0f)
     {
-      setPumpBrightness(255);  // No profile configured → full power
+      setPumpBrightness(255);  // No usable curve → full power
       return;
     }
 
@@ -3457,6 +3615,9 @@ void brewDetect()
       sendNextionCommand("waveTimer.en=1");
       sendNextionCommand("tm0.en=1");
       brewPreviewNeedsDraw = false;
+      // The lever can be pulled from any page, so the brew page may only just
+      // have loaded — with the recipe panel at its design-time values.
+      writeRecipePanel();
 
       brewTimer(true);
       writeBrewButtonPicture(25);

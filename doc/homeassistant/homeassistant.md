@@ -19,8 +19,9 @@ Everything is grouped under a single device named **Mara X**:
 | Serial frame | sensor | `marax/sensor/debug` | Raw GiCar frame, filed as a diagnostic entity |
 | Heating element | binary_sensor | `marax/sensor/heatingelement` | |
 | Power | binary_sensor | `marax/sensor/power_state` | |
-| Profile | select | `marax/profile/name` | Options are the profiles on the SD card |
-| Profile command result | sensor | `marax/profile/result` | Diagnostic; the answer to the last edit |
+| Recipe | select | `marax/recipe/active` | Options are the recipes on the SD card, plus `(none)` |
+| Brew by recipe | switch | `marax/recipe/mode` | The settings page's switch; off, the machine brews as a stock Mara X |
+| Recipe command result | sensor | `marax/recipe/result` | Diagnostic; the answer to the last recipe command |
 
 ### Availability
 
@@ -84,52 +85,74 @@ differ.
 
 The device then lives at **Settings → Devices & Services → MQTT → Mara X**.
 
-## Editing profiles
+## Recipes
 
-The controller also publishes the pressure profiles stored on its SD card and
-accepts edits back over MQTT. The **Profile** select entity is enough to switch
-profiles from a dashboard or an automation; the custom card below adds a curve
-you can drag.
+A recipe is one coffee, dialled in: grind setting, dose, yield, temperature
+switch position and its own pressure curve. What each field does on the
+machine, and the file format, are in [the recipe docs](../recipes/recipes.md).
+
+- The **Recipe** select sets the machine up for a recipe — its curve for the
+  pump, its yield as the brew-by-weight target — from a dashboard or an
+  automation. Picking one also switches brew by recipe on. `(none)` selects
+  no recipe.
+- The **Brew by recipe** switch is the same as the one on the machine's
+  settings page. Off, the machine brews as a stock Mara X — full pump, no
+  weight cut-off — and the selected recipe is kept for when it goes back on.
+
+The recipe card below is where recipes are made.
 
 ### Topics
 
 | Topic | Direction | Payload |
 | --- | --- | --- |
-| `marax/profile/list` | published, retained | Comma-separated profile file names |
-| `marax/profile/name` | published, retained | The loaded profile's file name |
-| `marax/profile/active` | published, retained | The loaded profile as v2 CSV |
-| `marax/profile/result` | published | `ok: …` or `error: …` for the last command |
-| `marax/profile/select` | subscribed | A profile file name to load |
-| `marax/profile/save/<name>` | subscribed | A v2 CSV body to write to `/profiles/<name>.csv` |
-| `marax/profile/delete/<name>` | subscribed | Any payload; deletes that profile |
+| `marax/recipe/list` | published, retained | Comma-separated recipe file names |
+| `marax/recipe/active` | published, retained | The selected recipe, or `(none)` |
+| `marax/recipe/home` | published, retained | The three home tiles, e.g. `ethiopia_guji,house_blend,` |
+| `marax/recipe/mode` | published, retained | `ON` or `OFF` |
+| `marax/recipe/body/<name>` | published, retained | Each recipe file as it is on the card |
+| `marax/recipe/result` | published | `ok: …` or `error: …` for the last command |
+| `marax/recipe/select` | subscribed | A recipe file name, or `(none)` |
+| `marax/recipe/save/<name>` | subscribed | A recipe CSV to write to `/recipes/<name>.csv` |
+| `marax/recipe/delete/<name>` | subscribed | Any payload; deletes that recipe |
+| `marax/recipe/home/set` | subscribed | Up to three recipe names, comma separated, one per tile |
+| `marax/recipe/mode/set` | subscribed | `ON` or `OFF` |
 
-The same [v2 CSV](../profiles/profiles.md#the-v2-format) travels in both
-directions, so what you edit is byte for byte what the pump follows.
+Every recipe is published in full, so the card has the whole library without
+asking for it. `marax/recipe/list` is the authority on what exists: a body can
+outlive its file on the broker if the file is removed from the card by hand,
+and anything reading the bodies should check them against the list.
 
-A few rules the firmware enforces, each answered on the result topic:
+The recipe CSV travels unchanged in both directions, so what you edit is byte
+for byte what is stored and what the pump follows. A few rules the firmware
+enforces, each answered on the result topic:
 
 - **Commands during a shot are refused**, not queued. An edit must not land
   seconds after the lever drops.
-- **Profile names may only contain letters, digits, underscore and dash.** They
-  become file names, and rejecting `.` rules out path traversal.
+- **Recipe file names may only contain letters, digits, underscore and dash.**
+  They become file names and topic levels, and rejecting `.` rules out path
+  traversal.
 - **A body is validated with the same parser that will later read it back**
   off the card, so nothing can be accepted here and fail on reload.
-- **The loaded profile cannot be deleted.** Select another one first.
-- Saving the profile that is currently loaded reloads it immediately, so the
-  change takes effect without touching the machine.
+- **Saving the selected recipe reloads it immediately**, so the change takes
+  effect without touching the machine.
+- **Deleting the selected recipe** leaves the machine with none selected.
 
-Switching profiles by hand, if you want it in an automation:
+The controller holds **one command at a time** and drops a second that
+arrives before the first is answered. Scripts that send several should wait
+for each answer on `marax/recipe/result`; the card does.
+
+Putting recipes on the tiles from an automation:
 
 ```yaml
 action: mqtt.publish
 data:
-  topic: marax/profile/select
-  payload: classic_espresso
+  topic: marax/recipe/home/set
+  payload: ethiopia_guji,house_blend,decaf
 ```
 
-### The curve editor card
+### The recipe card
 
-`homeassistant/marax-profile-card.js` in this repository is a self-contained
+`homeassistant/marax-recipe-card.js` in this repository is a self-contained
 Lovelace card — no HACS, no build step, no external dependencies.
 
 **1. Find the config directory.** In a Docker install it is the host folder
@@ -143,7 +166,7 @@ docker inspect homeassistant --format '{{range .Mounts}}{{.Source}} -> {{.Destin
 fresh install — create it. Home Assistant serves it at `/local/`:
 
 ```sh
-scp homeassistant/marax-profile-card.js you@homeassistant:/your/config/www/
+scp homeassistant/marax-recipe-card.js you@homeassistant:/your/config/www/
 ```
 
 **3. Restart Home Assistant** if you just created `www/`. The `/local/` route is
@@ -152,40 +175,68 @@ reason a freshly installed card does not appear. Files dropped into an existing
 `www/` need no restart.
 
 **4. Register it.** **Settings → Dashboards → ⋮ → Resources → + Add resource**,
-URL `/local/marax-profile-card.js`, type **JavaScript module**. If the menu has
+URL `/local/marax-recipe-card.js`, type **JavaScript module**. If the menu has
 no Resources entry, enable **Advanced Mode** in your user profile — it is
 hidden otherwise.
 
 **5. Hard-refresh the browser** (Ctrl+Shift+R). The card is cached aggressively.
 When you update it later, bump a version in the resource URL
-(`/local/marax-profile-card.js?v=2`), or browsers keep serving the old copy.
+(`/local/marax-recipe-card.js?v=2`), or browsers keep serving the old copy.
 
 Then add it to a dashboard:
 
 ```yaml
-type: custom:marax-profile-card
+type: custom:marax-recipe-card
 # prefix: marax    # only if you changed the MQTT topic prefix
 ```
 
-To check where a failure is: open `http://<home-assistant>:8123/local/marax-profile-card.js`
+To check where a failure is: open `http://<home-assistant>:8123/local/marax-recipe-card.js`
 in a browser. A 404 means step 2 or 3. If it loads but the dashboard says
-*"Custom element doesn't exist: marax-profile-card"*, it is step 4 or 5.
+*"Custom element doesn't exist: marax-recipe-card"*, it is step 4 or 5.
 
-Drag a point to move it, tap an empty part of the graph to add one, and use the
-row below the graph to type exact values, switch a point between ramp and jump,
-or remove it. A filled handle is a jump, an outlined one a ramp. The first
-point is pinned to t=0, since that is where the shot starts. **Save** writes
-back to the profile you loaded; **Save as…** writes a new file.
+At the top, the card has the **Brew by recipe** switch and the selected
+recipe. Below, it lists every recipe with its dose, yield, ratio, grind and
+temperature, and which home tile it is on.
 
-Switching profiles in the picker always shows the newly loaded one, discarding
-any unsaved edits and saying so in the status line — the card showing a
-different profile from the one the machine has loaded would be worse than
-losing an edit. Edits do survive the controller simply repeating itself, such
-as the retained profile arriving again after a reconnect.
+- **Use** sets the machine up for a recipe and switches brew by recipe on.
+- **Click a recipe** to edit it: name, grind, dose, yield (or type a ratio and
+  the yield follows the dose), the temperature switch, the home-screen tile,
+  and the curve.
+- **The curve** is dragged: drag a point to move it, tap an empty part of the
+  graph to add one, and use the row below it to type exact values, switch a
+  point between ramp and jump, or remove it. A filled handle is a jump, an
+  outlined one a ramp; the first point is pinned to the start of the shot.
+- **Replace the curve with…** copies one of the built-in starting curves
+  (classic 9 bar, pre-infusion ramp, blooming, declining, …) or another
+  recipe's. The copy is independent: editing it never changes where it came
+  from.
+- **Home screen tile** puts the recipe on tile 1, 2 or 3. A tile holds one
+  recipe, so the card says which recipe it would replace.
+- **New recipe** starts from a flat 9 bar curve. The file name is made from the
+  name when it is first saved, and stays the same if the recipe is renamed
+  later.
+
+Nothing reaches the machine until **Save**. A save and a tile change are sent
+one after the other, each waiting for the machine's answer.
 
 The card reads MQTT through Home Assistant's websocket API, which is
 **available to admin users only** — a non-admin will see a subscribe error
-instead of the curve.
+instead of the recipes.
+
+### Coming from profiles
+
+Earlier versions kept pressure profiles in `/profiles` and had a profile
+card, a *Profile* select and a *Profile command result* sensor. The firmware
+no longer reads `/profiles`, and removes those two entities from Home
+Assistant itself when it connects. Delete `marax-profile-card.js` from
+`<config>/www/` and its resource entry. Old retained profile topics can be
+cleared from the broker with:
+
+```sh
+for t in list name active result; do
+  mosquitto_pub -h 192.168.1.67 -u marax -P '<your-password>' -r -n -t "marax/profile/$t"
+done
+```
 
 ## A ready-made dashboard
 
@@ -195,15 +246,15 @@ dashboard. Paste it into **Settings → Dashboards → *your dashboard* → ⋮ 
 
 | View | What it holds |
 | --- | --- |
-| Machine | Brew and steam gauges, power and heating tiles, shot count, a fast-heat countdown that appears only while it is running, and a three-hour temperature graph |
-| Profile | The curve editor, a profile picker that works even if the custom card fails to load, and the result of the last profile command |
+| Machine | Brew and steam gauges, power and heating tiles, shot count, the selected recipe and the brew-by-recipe switch, a fast-heat countdown that appears only while it is running, and a three-hour temperature graph |
+| Recipes | The recipe card and the result of the last recipe command |
 | Diagnostics | Every entity in plain rows, plus a reference table of the MQTT topics |
 
 The Machine view leads with two conditional banners, because "no reading" has
 two quite different causes here: the controller being offline (everything
 unavailable, via the MQTT last will) and the machine simply being switched off
 (temperatures unavailable by design, so they cannot drag the history graph down
-to 0 °C). Only the Profile view needs the custom card; everything else is
+to 0 °C). Only the Recipes view needs the custom card; everything else is
 built-in cards.
 
 The entity IDs assume Home Assistant slugged the device as `mara_x` — for
@@ -237,8 +288,19 @@ mosquitto_sub -h 192.168.1.67 -u marax -P '<your-password>' -v -t 'marax/#' -t '
   user is not an admin, or the MQTT integration is not set up.
 - **An edit reports `error: brew in progress`** — commands are refused during a
   shot by design. Try again once the lever is back.
-- **An edit reports `error: profile body rejected by the parser`** — most often
+- **An edit reports `error: recipe body rejected by the parser`** — most often
   points that are not in ascending time order, or fewer than two of them.
+- **A recipe is on the card but missing from the list** — its file name has a
+  character other than letters, digits, `_` and `-`, or it does not parse. The
+  serial log says which: `[SD] scanRecipes: skipped …`.
+- **The home tiles stay empty** — the display needs the tiles added to its
+  HMI; see [the display changes](../ui/recipes_display.md). If they show text
+  but never hide or show, check `HOME_PAGE_ID`.
+- **A shot ignores the recipe** — brew by recipe is off (the header on the brew
+  page says so), or no recipe is selected.
+- **A command reports `error: no answer from the machine`** in the recipe
+  card — the controller did not reply within eight seconds: it is offline, or
+  was busy with another command and dropped this one.
 - **A renamed or removed entity lingers** — the discovery payloads are
   retained. Clear the old one with an empty retained message:
   ```sh

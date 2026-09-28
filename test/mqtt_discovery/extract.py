@@ -4,7 +4,7 @@ import io, re, sys
 
 src = io.open("src/marax_esp32s3/marax_esp32s3.ino", encoding="utf-8").read()
 
-defines = re.search(r'#define brewtemp_topic.*?#define PROFILE_SELECT_MAX_OPTIONS \d+', src, re.S).group(0)
+defines = re.search(r'#define brewtemp_topic.*?#define RECIPE_BODY_MAX_LEN +\d+', src, re.S).group(0)
 block = re.search(r'#if !defined\(DISABLE_WIFI_MQTT\) && defined\(ENABLE_HA_DISCOVERY\)\n(.*?)\n#endif\n',
                   src, re.S).group(1)
 
@@ -13,8 +13,7 @@ prelude = '''#include <string>
 #include <cstring>
 #include <algorithm>
 
-#define PROFILE_NAME_MAX_LEN 32
-#define MAX_PROFILES 64
+#define RECIPE_NAME_MAX_LEN 32
 
 struct String {
   std::string s;
@@ -57,10 +56,16 @@ struct FakeClient {
   }
 } mqttClient;
 
-char profileNames[MAX_PROFILES][PROFILE_NAME_MAX_LEN];
-int profileCount = 0;
+#define MAX_RECIPES %s
+struct RecipeInfo { char stem[RECIPE_NAME_MAX_LEN]; };
+RecipeInfo recipes[MAX_RECIPES];
+int recipeCount = 0;
 
 '''
+
+# Taken from the sketch so the worst case tested is the one that ships.
+max_recipes = re.search(r'#define MAX_RECIPES (\d+)', src).group(1)
+prelude = prelude.replace("#define MAX_RECIPES %s", "#define MAX_RECIPES " + max_recipes)
 
 open(sys.argv[1], "w").write("#include <cstdint>\n" + defines + "\n\n" + prelude + block)
 print("extracted discovery block")

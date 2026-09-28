@@ -17,21 +17,27 @@ def grab(signature_re):
                 return src[m.start():j+1] + "\n"
     sys.exit("unbalanced: " + signature_re)
 
-globals_block = src[src.index("#define MAX_PROFILE_POINTS"):src.index("// SD / Profile globals")]
+globals_block = src[src.index("#define MAX_PROFILE_POINTS"):src.index("// SD and display globals")]
+# The recipe defines, struct and globals, up to the MQTT command queue.
+recipe_block = src[src.index("#define MAX_RECIPES"):src.index("// Kept here rather than up with the other MQTT globals")]
 
 funcs = [
-    grab(r"^static void setActiveProfileName"),
-    grab(r"^static bool isLegacyProfileHeader"),
-    grab(r"^static bool parseLegacyProfileRow"),
-    grab(r"^static bool parseProfileV2Line"),
+    grab(r"^static bool parsePointLine"),
     grab(r"^float profileTotalSeconds"),
     grab(r"^float profileTargetPressureAt"),
-    grab(r"^void applyManualStepsToProfile"),
     grab(r"^uint32_t profileSegmentSignature"),
     grab(r"^int pressureToWave"),
-    grab(r"^static bool sanitizeProfileStem"),
-    grab(r"^void buildProfileCsv"),
-    grab(r"^static bool validateProfileBody"),
+    grab(r"^static bool sanitizeRecipeStem"),
+    grab(r"^static int parseRecipeTemp"),
+    grab(r"^static const char \*recipeTempLabel"),
+    grab(r"^static void resetRecipeScratch"),
+    grab(r"^static void copyTrimmedValue"),
+    grab(r"^static bool parseRecipeLine"),
+    grab(r"^static bool parseBodyLines"),
+    grab(r"^static bool validateRecipeBody"),
+    grab(r"^static bool parseHomeSlots"),
+    grab(r"^static void formatGrams"),
+    grab(r"^static void buildHomeTileText"),
 ]
 
 prelude = '''#include <string>
@@ -41,10 +47,10 @@ prelude = '''#include <string>
 #include <cstdint>
 #include <algorithm>\n#include <cmath>
 
-#define PROFILE_NAME_MAX_LEN 32
-#define PROFILE_CSV_BUFFER_LEN 128
-#define PROFILE_FIELD_COUNT 10
+#define RECIPE_NAME_MAX_LEN 32
+#define RECIPE_LINE_MAX_LEN 128
 #define BREW_WAVEFORM_HEIGHT 180
+#define RECIPE_BODY_MAX_LEN 1024
 
 template <typename T> T constrain(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -75,9 +81,9 @@ struct FakeSerial {
   void println(int v) { std::printf("%d\\n", v); }
 } Serial;
 
-char activeProfileName[PROFILE_NAME_MAX_LEN];\n\n// Mirrors the forward declarations the .ino carries.\nvoid applyManualStepsToProfile();\nfloat profileTotalSeconds();\nfloat profileTargetPressureAt(float second);\nint pressureToWave(float bar);
+// Mirrors the forward declarations the .ino carries.\nfloat profileTotalSeconds();\nfloat profileTargetPressureAt(float second);\nint pressureToWave(float bar);
 
 '''
 
-open(sys.argv[1], "w").write(prelude + globals_block + "\n" + "\n".join(funcs))
+open(sys.argv[1], "w").write(prelude + globals_block + "\n" + recipe_block + "\n" + "\n".join(funcs))
 print("extracted %d functions" % len(funcs))

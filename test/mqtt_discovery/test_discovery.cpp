@@ -2,19 +2,18 @@
 
 // The discovery payloads have to fit PubSubClient's send buffer: anything
 // larger is dropped without an error at the MQTT layer, and the entity simply
-// never appears in Home Assistant. The profile picker is the risk, because its
-// payload carries one option per profile on the card.
+// never appears in Home Assistant. The recipe picker is the risk, because its
+// payload carries one option per recipe on the card.
 int main() {
   std::printf("\nfixed entities\n");
   publishHaDiscovery();
-  std::printf("\nprofile picker with a full card (%d profiles)\n", MAX_PROFILES);
-  for (int i = 0; i < MAX_PROFILES; i++) {
-    // Names as long as the buffer allows, so this is the true worst case.
-    std::snprintf(profileNames[i], PROFILE_NAME_MAX_LEN,
-                  "profile_%02d_aaaaaaaaaaaaaaaa.csv", i);
+  std::printf("\nrecipe picker with a full card (%d recipes)\n", MAX_RECIPES);
+  for (int i = 0; i < MAX_RECIPES; i++) {
+    // The longest stem sanitizeRecipeStem() lets through.
+    std::snprintf(recipes[i].stem, RECIPE_NAME_MAX_LEN, "recipe_%02d_aaaaaaaaaaaaaaaaaa", i);
   }
-  profileCount = MAX_PROFILES;
-  publishHaProfileSelect();
+  recipeCount = MAX_RECIPES;
+  publishHaRecipeSelect();
 
   std::printf("\nlargest frame %zu bytes, buffer %d bytes\n", maxFrame, MQTT_BUFFER_SIZE);
   if (overSized) {

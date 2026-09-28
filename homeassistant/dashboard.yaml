@@ -4,7 +4,7 @@
 # Paste the whole file into a dashboard's raw configuration editor:
 #   Settings → Dashboards → (your dashboard) → ⋮ → Edit → ⋮ → Raw configuration editor
 #
-# The profile view needs marax-profile-card.js registered as a resource first —
+# The recipes view needs marax-recipe-card.js registered as a resource first —
 # see doc/homeassistant/homeassistant.md. Everything else uses built-in cards
 # only, so the rest of the dashboard still works if that card is missing.
 #
@@ -108,6 +108,24 @@ views:
             name: Shots
             icon: mdi:coffee
 
+      # What the next shot will be, and a quick way to change it.
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: tile
+            entity: select.mara_x_recipe
+            name: Recipe
+            icon: mdi:notebook-outline
+            features:
+              - type: select-options
+          - type: tile
+            entity: switch.mara_x_brew_by_recipe
+            name: Brew by recipe
+            icon: mdi:notebook-check-outline
+            features:
+              - type: toggle
+
       # Fast heat only means anything while it is counting down.
       - type: conditional
         conditions:
@@ -135,45 +153,43 @@ views:
             name: Heating
 
   # ────────────────────────────────────────────────────────────────────────
-  - title: Profile
-    path: profile
-    icon: mdi:chart-bell-curve-cumulative
+  - title: Recipes
+    path: recipes
+    icon: mdi:notebook-outline
     cards:
-      # Works whether or not the custom card loaded, so the machine can always
-      # be pointed at a different profile from here.
-      - type: tile
-        entity: select.mara_x_profile
-        name: Active profile
-        icon: mdi:playlist-play
-        features:
-          - type: select-options
-
-      - type: custom:marax-profile-card
-        title: Pressure profile
+      - type: custom:marax-recipe-card
+        title: Recipes
         # prefix: marax   # only if you changed the MQTT topic prefix
 
-      # Every save, select and delete is answered here.
+      # Every save, select, delete and tile change is answered here.
       - type: conditional
         conditions:
-          - entity: sensor.mara_x_profile_command_result
+          - entity: sensor.mara_x_recipe_command_result
             state_not: unknown
-          - entity: sensor.mara_x_profile_command_result
+          - entity: sensor.mara_x_recipe_command_result
             state_not: unavailable
         card:
           type: tile
-          entity: sensor.mara_x_profile_command_result
-          name: Last profile command
+          entity: sensor.mara_x_recipe_command_result
+          name: Last recipe command
           icon: mdi:message-alert-outline
 
       - type: markdown
         content: |-
-          Drag a point to move it, tap an empty part of the graph to add one.
-          A **filled** handle jumps — it holds the previous pressure and steps
-          at its own time; an **outlined** handle ramps in from the point
-          before it. The first point is pinned to the start of the shot.
+          A recipe is one coffee, dialled in: grind setting, dose, yield,
+          temperature switch position and its own pressure curve. **Use**
+          sets the machine up for it — the yield becomes the brew-by-weight
+          target. Up to three recipes can sit on the machine's home screen;
+          tapping one there does the same and opens the brew page, which
+          then shows what to grind, dose and set the switch to.
 
 
-          Edits are refused while a shot is running.
+          With **Brew by recipe** off the machine brews as a stock Mara X:
+          full pump, no weight cut-off.
+
+
+          The grind and the temperature switch are guidance only: the
+          controller cannot turn either of them.
 
   # ────────────────────────────────────────────────────────────────────────
   - title: Diagnostics
@@ -187,10 +203,12 @@ views:
             name: Power state
           - entity: sensor.mara_x_serial_frame
             name: Raw GiCar frame
-          - entity: sensor.mara_x_profile_command_result
-            name: Last profile command
-          - entity: select.mara_x_profile
-            name: Active profile
+          - entity: select.mara_x_recipe
+            name: Selected recipe
+          - entity: switch.mara_x_brew_by_recipe
+            name: Brew by recipe
+          - entity: sensor.mara_x_recipe_command_result
+            name: Last recipe command
 
       - type: entities
         title: Readings
@@ -208,10 +226,14 @@ views:
           | Topic | Meaning |
           | --- | --- |
           | `marax/status` | `online` / `offline`, the controller's last will |
-          | `marax/profile/list` | Profiles on the SD card |
-          | `marax/profile/name` | Loaded profile's file name |
-          | `marax/profile/active` | Loaded profile as v2 CSV |
-          | `marax/profile/result` | Answer to the last command |
-          | `marax/profile/select` | Send a file name to load it |
-          | `marax/profile/save/<name>` | Send a v2 CSV to write it |
-          | `marax/profile/delete/<name>` | Send anything to delete it |
+          | `marax/recipe/list` | Recipes on the SD card |
+          | `marax/recipe/active` | Selected recipe, or `(none)` |
+          | `marax/recipe/home` | The three home tiles |
+          | `marax/recipe/mode` | Brew by recipe, `ON` / `OFF` |
+          | `marax/recipe/body/<name>` | Every recipe file, as on the card |
+          | `marax/recipe/result` | Answer to the last recipe command |
+          | `marax/recipe/select` | Send a recipe name, or `(none)` |
+          | `marax/recipe/save/<name>` | Send a recipe CSV to write it |
+          | `marax/recipe/delete/<name>` | Send anything to delete it |
+          | `marax/recipe/home/set` | Send `a,b,c` to assign the tiles |
+          | `marax/recipe/mode/set` | Send `ON` or `OFF` |

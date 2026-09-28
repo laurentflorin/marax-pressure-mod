@@ -8,13 +8,14 @@ This mod is a fork of [marax-pressure-mod](https://github.com/larszi/marax-press
 - Using [the guide of m1n1.de](https://www.m1n1.de/en/lelit-mara-x-v2-gicar-internals) the display and ESP32 can be powered via the 12V output of the Gicar using a step down voltage converter, everthing else needing 5V power is also powerd via the Gicar.
 - Using the Felicita Arc brew by weight was implemented. A simple lienear model, using current weight, current pressure and current flow rate is used to predict the final weight (when the pump is turned of there is still pressure in the group head, so the final weight is not when the pump is turned off, final weight is defined when weight does not change more tha 0.5 grams for 3 seconds)
 - So the parameters for the linear model can be learned and constantly updated storage is needed, so a SD card is added to the build.
-- SD card allows to store pre-programmed pressure profiles.
+- SD card stores the recipes, each with its own pressure curve.
 - Slightly larger display is used.
 - Different pressure sensor is used, so no resistors are needed
 - OTA updates are possible
 - Implemented on a ESP32 S3 instead of an Arduino
-- Pressure profiles are polylines rather than four fixed steps: each point anchors a pressure at a time, and reaches it either by ramping linearly from the previous point or by jumping to it, so a profile can hold a pressure, step straight to another, and then ramp away. See [the profile docs](doc/profiles/profiles.md).
-- Home Assistant integration over MQTT with auto-discovery, including editing the SD-card profiles by dragging the curve in a custom Lovelace card. See [the Home Assistant docs](doc/homeassistant/homeassistant.md).
+- Pressure curves are polylines rather than four fixed steps: each point anchors a pressure at a time, and reaches it either by ramping linearly from the previous point or by jumping to it, so a curve can hold a pressure, step straight to another, and then ramp away.
+- Home Assistant integration over MQTT with auto-discovery, including a custom Lovelace card to edit the recipes on the SD card and drag their pressure curves. See [the Home Assistant docs](doc/homeassistant/homeassistant.md).
+- Recipes: one per coffee, with grind setting, dose, yield, temperature switch position and its own pressure curve, kept on the SD card and edited in Home Assistant. Up to three sit on the machine's home screen; a tap sets the machine up and opens the brew page, which shows what to grind, dose and set, so anyone can pull the shot you dialled in. One switch on the machine turns brewing by recipe off, for a stock Mara X shot. See [the recipe docs](doc/recipes/recipes.md).
 
 ### Similar projects
 

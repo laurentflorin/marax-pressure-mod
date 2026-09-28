@@ -8,7 +8,9 @@
 
 [The Build](build/build.md)
 
-[Pressure Profiles](profiles/profiles.md)
+[Recipes](recipes/recipes.md)
+
+[Display changes for recipes](ui/recipes_display.md)
 
 [Home Assistant Integration](homeassistant/homeassistant.md)
 
