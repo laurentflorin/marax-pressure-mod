@@ -71,32 +71,32 @@ where the logo is now.
 
 Add three **Button** components (a Text with a touch event works as well):
 
-| Attribute | r1 | r2 | r3 |
-| --- | --- | --- | --- |
-| `objname` | `r1` | `r2` | `r3` |
+| Attribute                  | r1              | r2                | r3                |
+| -------------------------- | --------------- | ----------------- | ----------------- |
+| `objname`                | `r1`          | `r2`            | `r3`            |
 | `x`, `y`, `w`, `h` | 8, 84, 148, 144 | 166, 84, 148, 144 | 324, 84, 148, 144 |
 
 The same on all three:
 
-| Attribute | Value | Why |
-| --- | --- | --- |
-| `vscope` | **global** | The firmware writes the tiles whichever page is open; a local component only keeps what was written while its page was loaded |
-| `sta` | solid colour | |
-| `bco` / `pco` | 8518 / 65535 | Match `RECIPE_TILE_BCO` / `RECIPE_TILE_PCO`; the firmware sets them anyway |
-| `bco2` / `pco2` | 17036 / 2016 | Pressed look |
-| `font` | a 20–24 px font | Five lines have to fit in 144 px |
-| `xcen` / `ycen` | 0 (left) / 1 (centre) | |
-| `isbr` | **1** | The text uses `\r` line breaks, and long names wrap |
-| `txt` | *(empty)* | So nothing flashes up before the firmware fills it |
-| `txt_maxl` | 120 | |
+| Attribute           | Value                 | Why                                                                                                                           |
+| ------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `vscope`          | **global**      | The firmware writes the tiles whichever page is open; a local component only keeps what was written while its page was loaded |
+| `sta`             | solid colour          |                                                                                                                               |
+| `bco` / `pco`   | 8518 / 65535          | Match`RECIPE_TILE_BCO` / `RECIPE_TILE_PCO`; the firmware sets them anyway                                                 |
+| `bco2` / `pco2` | 17036 / 2016          | Pressed look                                                                                                                  |
+| `font`            | a 20–24 px font      | Five lines have to fit in 144 px                                                                                              |
+| `xcen` / `ycen` | 0 (left) / 1 (centre) |                                                                                                                               |
+| `isbr`            | **1**           | The text uses`\r` line breaks, and long names wrap                                                                          |
+| `txt`             | *(empty)*           | So nothing flashes up before the firmware fills it                                                                            |
+| `txt_maxl`        | 120                   |                                                                                                                               |
 
 **Touch Release Event** — untick *Send Component ID* and enter:
 
-| Tile | Code |
-| --- | --- |
-| r1 | `printh 23 02 52 01` |
-| r2 | `printh 23 02 52 02` |
-| r3 | `printh 23 02 52 03` |
+| Tile | Code                   |
+| ---- | ---------------------- |
+| r1   | `printh 23 02 52 01` |
+| r2   | `printh 23 02 52 02` |
+| r3   | `printh 23 02 52 03` |
 
 That is a small custom packet (`#`, length 2, `R`, tile number) rather than a
 plain touch event, so it does not depend on the component ids the editor hands
@@ -206,20 +206,20 @@ lever, and the header names the recipe.
 Five **Text** components for the values, plus five static Text labels
 (`Grind`, `In`, `Out`, `Ratio`, `Temp`) the firmware never touches:
 
-| `objname` | Example | Shows |
-| --- | --- | --- |
-| `rGrind` | `2.4` | The recipe's grind setting |
-| `rDose` | `18 g` | Grams in |
-| `rYield` | `40 g` | Grams out — the brew-by-weight target |
-| `rRatio` | `1:2.2` | Yield ÷ dose |
-| `rTemp` | `II` | Temperature switch position |
+| `objname` | Example   | Shows                                  |
+| ----------- | --------- | -------------------------------------- |
+| `rGrind`  | `2.4`   | The recipe's grind setting             |
+| `rDose`   | `18 g`  | Grams in                               |
+| `rYield`  | `40 g`  | Grams out — the brew-by-weight target |
+| `rRatio`  | `1:2.2` | Yield ÷ dose                          |
+| `rTemp`   | `II`    | Temperature switch position            |
 
 Positions, one row per value, 36 px apart from the top of the graph:
 
-| | x | w | rows (y, h 36) |
-| --- | --- | --- | --- |
-| Labels | 344 | 52 | 95, 131, 167, 203, 239 |
-| Values `rGrind` … `rTemp` | 400 | 72 | the same rows, in that order |
+|                               | x   | w  | rows (y, h 36)               |
+| ----------------------------- | --- | -- | ---------------------------- |
+| Labels                        | 344 | 52 | 95, 131, 167, 203, 239       |
+| Values`rGrind` … `rTemp` | 400 | 72 | the same rows, in that order |
 
 For each value: `txt` empty, `txt_maxl` 16, right-aligned (`xcen` 2), local
 scope is fine. With no recipe in charge the firmware writes `-` into all five.
