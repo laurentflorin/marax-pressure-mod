@@ -38,6 +38,7 @@ funcs = [
     grab(r"^static bool parseHomeSlots"),
     grab(r"^static void formatGrams"),
     grab(r"^static void buildHomeTileText"),
+    grab(r"^uint32_t recipeShotFingerprint"),
 ]
 
 prelude = '''#include <string>

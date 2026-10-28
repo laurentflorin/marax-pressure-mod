@@ -27,7 +27,7 @@ On the settings page the other pages can be reached. Its one switch, **Brew by r
 
 The brew graph page will automatically be shown if the brew leaver it switched to the "on/top" postion
 
-When brewing by recipe the header shows the recipe's name, the graph previews its curve, and a panel beside the graph shows the grind setting, dose, target weight, ratio and temperature switch position, so whoever is at the machine knows what to do before pulling the lever. Otherwise the header says why no recipe applies.
+When brewing by recipe the header shows the recipe's name — with, when no scale is connected, the remembered time that will end the shot, as in *Ethiopia Guji (27 s)* — the graph previews its curve, and a panel beside the graph shows the grind setting, dose, target weight, ratio and temperature switch position, so whoever is at the machine knows what to do before pulling the lever. Otherwise the header says why no recipe applies.
 
 ## Cleaning Page
 

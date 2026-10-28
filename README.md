@@ -16,6 +16,7 @@ This mod is a fork of [marax-pressure-mod](https://github.com/larszi/marax-press
 - Pressure curves are polylines rather than four fixed steps: each point anchors a pressure at a time, and reaches it either by ramping linearly from the previous point or by jumping to it, so a curve can hold a pressure, step straight to another, and then ramp away.
 - Home Assistant integration over MQTT with auto-discovery, including a custom Lovelace card to edit the recipes on the SD card and drag their pressure curves. See [the Home Assistant docs](doc/homeassistant/homeassistant.md).
 - Recipes: one per coffee, with grind setting, dose, yield, temperature switch position and its own pressure curve, kept on the SD card and edited in Home Assistant. Up to three sit on the machine's home screen; a tap sets the machine up and opens the brew page, which shows what to grind, dose and set, so anyone can pull the shot you dialled in. One switch on the machine turns brewing by recipe off, for a stock Mara X shot. See [the recipe docs](doc/recipes/recipes.md).
+- Without the scale, a recipe's shot stops after as long as the scale last took to reach its yield. Shots with a scale that was not tared, got bumped or stopped sending do not count, so a bad measurement is never repeated. See [Without the scale](doc/recipes/recipes.md#without-the-scale).
 
 ### Similar projects
 

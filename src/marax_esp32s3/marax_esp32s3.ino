@@ -524,6 +524,60 @@ unsigned long pendingStabilityCheckTime = 0;
 int pendingBrewTimeS = 0;
 
 // nunununununununununununununununununununununununununununununun
+// nunununununununununununu Remembered shot times
+// nunununununununununununununununununununununununununununununun
+// Without the scale a recipe's yield cannot be weighed, so the shot stops after
+// as long as the same recipe last took to reach it by weight. With the scale
+// connected the weight always decides and the remembered time is not used.
+//
+// A time is only remembered from a shot nothing was wrong with. One measured
+// off a scale that was not tared, got bumped or went quiet would stop every
+// later shot without the scale at the wrong moment, so the scale's readings are
+// watched from the lever going up to the cut-off, and the first thing that
+// looks wrong rules the shot out. The time remembered before it stays.
+//
+// Times live in NVS, filed under a hash of the recipe's file name together
+// with a fingerprint of everything in the recipe that changes how long it
+// takes. An edited recipe therefore has no time until the scale has measured
+// it again.
+//
+// Shorter than this, something went wrong rather than the coffee ran fast.
+#define SHOT_TIME_MIN_SECONDS 10.0f
+// Nor longer than this: a puck that choked that badly is not a shot to repeat.
+#define SHOT_TIME_MAX_SECONDS 120.0f
+// What the scale may read as the lever goes up: drips, not a cup.
+#define SHOT_TIME_MAX_START_WEIGHT_G 2.0f
+// Faster than coffee comes out of the group, in either direction. A reading
+// that moves faster was the cup being set down or lifted, a bump, or a tare.
+// It also bounds the whole shot: the yield cannot arrive faster than this.
+#define SHOT_TIME_MAX_FLOW_GPS 8.0f
+// Allowed on top of that between two readings, for the scale's own jitter.
+#define SHOT_TIME_WEIGHT_JITTER_G 1.0f
+// The Felicita sends ~10 readings a second. A gap this long means the weight
+// the cut-off acted on may have been seconds old.
+#define SHOT_TIME_MAX_SAMPLE_GAP_MS 2000
+
+struct RememberedShotTime
+{
+  uint32_t fingerprint;  // recipeShotFingerprint() of the recipe it was measured on
+  float seconds;         // lever up to the weight cut-off
+};
+
+// The active recipe's remembered time, 0 when it has none.
+float activeShotSeconds = 0.0f;
+uint32_t activeRecipeFingerprint = 0;
+// Why the shot running now cannot be trusted to time the recipe, or NULL while
+// nothing has looked wrong.
+const char *shotTimeDoubt = NULL;
+// The scale's previous reading during the shot.
+unsigned long shotLastSampleMs = 0;
+float shotLastSampleWeight = 0.0f;
+// Lever up to cut-off of a shot the weight stopped and that passed every
+// check. Written to NVS when the lever comes down; 0 when there is nothing to
+// write.
+float shotTimeToRemember = 0.0f;
+
+// nunununununununununununununununununununununununununununununun
 // nunununununununununununu LowPassFilterStuff
 // nunununununununununununununununununununununununununununununun
 const float alpha = 0.97; // Low Pass Filter alpha (0 - 1)
@@ -596,9 +650,10 @@ unsigned long boilerOverPressureSinceMs = 0;
 unsigned long boilerFullLatchedAtMs = 0;
 // millis() of the last primePressureFilter() call, start of the settle window
 unsigned long pressureFilterPrimedAtMs = 0;
-// Latch: once the weight reaches target minus the pressure-dependent offset
-// during a profiled brew, keep the pump off until the brew ends (lever released)
-bool targetWeightReached = false;
+// Latch: once a brew by recipe has been cut — the weight reached target minus
+// the pressure-dependent offset, or without the scale the remembered time ran
+// out — keep the pump off until the brew ends (lever released)
+bool shotCutOff = false;
 volatile uint8_t  pumpBrightness = 255;  // 0-255, 255 = full power (no dimming)
 volatile uint32_t zeroCrossCount = 0;    // Incremented in ISR, read in debug
 hw_timer_t *acTimer = NULL;
@@ -1883,6 +1938,7 @@ bool loadRecipe(const char *stem)
   Serial.print("[RECIPE] Loaded '"); Serial.print(activeRecipe.name);
   Serial.print("' — "); Serial.print(profilePointCount);
   Serial.print(" points over "); Serial.print(profileTotalSeconds(), 1); Serial.println("s");
+  loadRememberedShotTime();
   return true;
 }
 
@@ -1918,6 +1974,7 @@ void clearActiveRecipe()
   Serial.print("[RECIPE] '"); Serial.print(activeRecipe.name); Serial.println("' is no longer active");
   memset(&activeRecipe, 0, sizeof(activeRecipe));
   profilePointCount = 0;
+  activeShotSeconds = 0.0f;
   preferences.remove("recipe");
   updateBrewHeader();
   writeRecipePanel();
@@ -2105,15 +2162,22 @@ void writeRecipePanel()
 }
 
 // The brew page's header: the recipe the shot will follow, or why none will.
-// `profileModetxt` is the global the brew page copies into its header when it
-// loads; `profileMode` is the header itself, for when the page is already
-// open.
+// Without the scale it adds the remembered time that will end the shot:
+// "Ethiopia Guji (27 s)". `profileModetxt` is the global the brew page copies
+// into its header when it loads; `profileMode` is the header itself, for when
+// the page is already open.
 void updateBrewHeader()
 {
+  char timed[RECIPE_NAME_MAX_LEN + 16];
   const char *header;
   if (!recipeModeEnabled)
   {
     header = "Brew by recipe off";
+  }
+  else if (isRecipeActive() && !scaleConnected && activeShotSeconds > 0.0f)
+  {
+    snprintf(timed, sizeof(timed), "%s (%d s)", activeRecipe.name, (int)(activeShotSeconds + 0.5f));
+    header = timed;
   }
   else if (isRecipeActive())
   {
@@ -2162,6 +2226,174 @@ void handleHomeTileTap()
   sendNextionCommand("page brew");
   updateBrewHeader();
   writeRecipePanel();
+}
+
+// Everything in the active recipe that changes how long it takes to reach its
+// yield — all of it but the name — and the live curve, which is the recipe's
+// own once it is loaded.
+uint32_t recipeShotFingerprint()
+{
+  uint32_t fingerprint = 2166136261u;
+  for (const char *c = activeRecipe.grind; *c != '\0'; c++)
+  {
+    fingerprint = (fingerprint ^ (uint8_t)*c) * 16777619u;
+  }
+  fingerprint = fingerprint * 31u + (uint32_t)(activeRecipe.dose * 10.0f);
+  fingerprint = fingerprint * 31u + (uint32_t)(activeRecipe.yield * 10.0f);
+  fingerprint = fingerprint * 31u + (uint32_t)(activeRecipe.temp + 1);
+  return fingerprint * 31u + profileSegmentSignature();
+}
+
+// NVS keys are at most 15 characters and a file name may be 31, so a time is
+// filed under a hash of the name.
+static void shotTimeKey(const char *stem, char *out, size_t outLen)
+{
+  uint32_t hash = 2166136261u;
+  for (const char *c = stem; *c != '\0'; c++)
+  {
+    hash = (hash ^ (uint8_t)*c) * 16777619u;
+  }
+  snprintf(out, outLen, "shot%08lx", (unsigned long)hash);
+}
+
+// Looks up the active recipe's remembered time. Called whenever a recipe is
+// loaded, so an edit is noticed the moment it takes effect.
+void loadRememberedShotTime()
+{
+  activeShotSeconds = 0.0f;
+  activeRecipeFingerprint = recipeShotFingerprint();
+
+  char key[16];
+  shotTimeKey(activeRecipe.stem, key, sizeof(key));
+  RememberedShotTime saved;
+  if (!preferences.isKey(key) ||
+      preferences.getBytes(key, &saved, sizeof(saved)) != sizeof(saved))
+  {
+    return;
+  }
+
+  if (saved.fingerprint != activeRecipeFingerprint)
+  {
+    Serial.print("[SHOT] '"); Serial.print(activeRecipe.name);
+    Serial.println("' changed since the scale timed it — the next shot with the scale times it again");
+    return;
+  }
+
+  activeShotSeconds = saved.seconds;
+  Serial.print("[SHOT] Without the scale '"); Serial.print(activeRecipe.name);
+  Serial.print("' stops after "); Serial.print(activeShotSeconds, 1); Serial.println("s");
+}
+
+void forgetShotTime(const char *stem)
+{
+  char key[16];
+  shotTimeKey(stem, key, sizeof(key));
+  if (preferences.isKey(key))
+  {
+    preferences.remove(key);
+  }
+}
+
+// The lever went up. Whether the scale was there and tared is only known now:
+// by the cut-off the cup has long been filling.
+void startShotEvidence()
+{
+  shotTimeToRemember = 0.0f;
+  shotTimeDoubt = NULL;
+  shotLastSampleMs = lastWeightTime;
+  shotLastSampleWeight = currentWeight;
+
+  if (!scaleConnected || lastWeightTime == 0)
+  {
+    shotTimeDoubt = "no scale when the lever went up";
+  }
+  else if (fabsf(currentWeight) > SHOT_TIME_MAX_START_WEIGHT_G)
+  {
+    shotTimeDoubt = "the scale was not tared when the lever went up";
+  }
+}
+
+// One reading from the scale between the lever going up and the cut-off.
+void noteShotWeight(unsigned long nowMs, float weight)
+{
+  unsigned long gapMs = nowMs - shotLastSampleMs;
+  float step = weight - shotLastSampleWeight;
+  shotLastSampleMs = nowMs;
+  shotLastSampleWeight = weight;
+
+  if (shotTimeDoubt != NULL)
+  {
+    return;
+  }
+
+  if (gapMs > SHOT_TIME_MAX_SAMPLE_GAP_MS)
+  {
+    shotTimeDoubt = "the scale went quiet during the shot";
+  }
+  else if (fabsf(step) > SHOT_TIME_MAX_FLOW_GPS * gapMs / 1000.0f + SHOT_TIME_WEIGHT_JITTER_G)
+  {
+    shotTimeDoubt = "the weight jumped faster than coffee flows";
+  }
+}
+
+// Why a shot the weight stopped `seconds` after the lever went up should not
+// time the recipe, or NULL when it can.
+const char *shotTimeRejection(float seconds, float yield)
+{
+  if (shotTimeDoubt != NULL)
+  {
+    return shotTimeDoubt;
+  }
+  if (seconds < SHOT_TIME_MIN_SECONDS || seconds < yield / SHOT_TIME_MAX_FLOW_GPS)
+  {
+    return "too short to be a real shot";
+  }
+  if (seconds > SHOT_TIME_MAX_SECONDS)
+  {
+    return "too long to be a real shot";
+  }
+  return NULL;
+}
+
+// The weight cut-off just stopped the shot. Its time is kept for when the
+// lever comes down, unless something about the shot says not to trust it.
+void considerShotTime(float seconds)
+{
+  const char *rejection = shotTimeRejection(seconds, activeRecipe.yield);
+  if (rejection != NULL)
+  {
+    Serial.print("[SHOT] Not remembering "); Serial.print(seconds, 1);
+    Serial.print("s for '"); Serial.print(activeRecipe.name);
+    Serial.print("': "); Serial.println(rejection);
+    return;
+  }
+  shotTimeToRemember = seconds;
+}
+
+void saveRememberedShotTime()
+{
+  if (shotTimeToRemember <= 0.0f || !isRecipeActive())
+  {
+    return;
+  }
+
+  activeShotSeconds = shotTimeToRemember;
+  shotTimeToRemember = 0.0f;
+  updateBrewHeader();
+
+  RememberedShotTime saved = { activeRecipeFingerprint, activeShotSeconds };
+  char key[16];
+  shotTimeKey(activeRecipe.stem, key, sizeof(key));
+  if (preferences.putBytes(key, &saved, sizeof(saved)) != sizeof(saved))
+  {
+    // Still used until the next reboot.
+    Serial.println("[SHOT] Could not write the shot time to NVS");
+    return;
+  }
+
+  Serial.print("[SHOT] '"); Serial.print(activeRecipe.name);
+  Serial.print("' took "); Serial.print(activeShotSeconds, 1);
+  Serial.println("s to its yield — remembered for shots without the scale");
 }
 
 void startPendingObservation(float flowAtStop, float pressAtStop)
@@ -2251,6 +2483,8 @@ void updateScaleConnectionUi()
     Serial.print(lastScaleConnectedUi);
     Serial.print(" -> ");
     Serial.println(connected);
+    // The header shows the remembered shot time only while there is no scale.
+    updateBrewHeader();
   }
 
   // Update global variable (used by home page timer to refresh scalecon.val)
@@ -2663,6 +2897,7 @@ static void processRecipeCommand()
       {
         clearActiveRecipe();
       }
+      forgetShotTime(stem);
 
       bool slotsChanged = false;
       for (int slot = 0; slot < RECIPE_HOME_SLOTS; slot++)
@@ -2880,6 +3115,13 @@ void updateScale()
     }
 
     lastWeightTime = now;
+
+    // Up to the cut-off: what comes after it, such as taking the cup away,
+    // says nothing about how long the shot took.
+    if (brewActive && !shotCutOff)
+    {
+      noteShotWeight(now, currentWeight);
+    }
   }
 }
 
@@ -3489,15 +3731,17 @@ void pressureProfile()
         targetWeight > 0.0f &&
         lastWeightTime > 0;
 
-    // Target-weight latch: once the cut-off weight has been reached, keep the
-    // pump off for the rest of this brew. Without this latch the pressure drop
-    // after the pump stops would shrink the offset again, and the profile
-    // segments below would switch the pump back on.
-    if (targetWeightReached)
+    // Cut-off latch: once the shot has been cut, keep the pump off for the
+    // rest of this brew. Without this latch the pressure drop after the pump
+    // stops would shrink the offset again, and the profile segments below
+    // would switch the pump back on.
+    if (shotCutOff)
     {
       setPumpBrightness(0);
       return;
     }
+
+    float brewSecs = (millis() - activeBrewingStart) / 1000.0f;
 
     if (brewByWeightActive)
     {
@@ -3509,17 +3753,30 @@ void pressureProfile()
         {
           startPendingObservation(flowRate, pressureNow);
         }
-        targetWeightReached = true;
+        shotCutOff = true;
         setPumpBrightness(0);
         writeBrewTimerColour(1535);
         writeSetBarValue(0);
+        considerShotTime(brewSecs);
         return;
       }
     }
+    // No scale to weigh the yield: stop when the last shot of this recipe the
+    // scale stopped did. The scale dropping out mid-shot lands here too.
+    else if (activeShotSeconds > 0.0f && brewSecs >= activeShotSeconds)
+    {
+      shotCutOff = true;
+      setPumpBrightness(0);
+      writeBrewTimerColour(1535);
+      writeSetBarValue(0);
+      Serial.print("[SHOT] No scale — stopped at "); Serial.print(activeShotSeconds, 1);
+      Serial.println("s, the recipe's remembered time");
+      return;
+    }
 
     // Safety: a curve with no duration is not usable. Skip it so the pump is
-    // not silently killed. This is checked after the weight cut-off above so
-    // brew-by-weight still stops the shot either way.
+    // not silently killed. This is checked after the cut-offs above so they
+    // still stop the shot either way.
     float totalProfileSeconds = profileTotalSeconds();
     if (totalProfileSeconds <= 0.0f)
     {
@@ -3527,11 +3784,9 @@ void pressureProfile()
       return;
     }
 
-    float brewSecs = (millis() - activeBrewingStart) / 1000.0f;
-
     // profileTargetPressureAt() holds the last point's pressure once the
-    // profile has run out, letting the weight cut-off above — or the lever —
-    // end the shot. Cutting the pump here would end a brew-by-weight shot short
+    // profile has run out, letting a cut-off above — or the lever — end the
+    // shot. Cutting the pump here would end a brew-by-weight shot short
     // of its target whenever the profile is shorter than the shot takes.
     float target = profileTargetPressureAt(brewSecs);
     writeSetBarValue(pressureToWave(target));
@@ -3622,7 +3877,22 @@ void brewDetect()
       brewTimer(true);
       writeBrewButtonPicture(25);
       brewActive = true;
-      targetWeightReached = false;  // Fresh brew — clear the weight cut-off latch
+      shotCutOff = false;  // Fresh brew — clear the cut-off latch
+      startShotEvidence();
+
+      if (recipeInCharge() && activeRecipe.yield > 0.0f && !(scaleConnected && lastWeightTime > 0))
+      {
+        Serial.print("[SHOT] No scale — ");
+        if (activeShotSeconds > 0.0f)
+        {
+          Serial.print("stopping after "); Serial.print(activeShotSeconds, 1);
+          Serial.println("s, as long as the scale last took to the yield");
+        }
+        else
+        {
+          Serial.println("no remembered time for this recipe, the lever ends the shot");
+        }
+      }
 
       // Seed dimmer debug counters so the first ZC/s reading is not
       // inflated by zero-crossings accumulated since boot.
@@ -3645,8 +3915,9 @@ void brewDetect()
     // chatter) and reset boilerFullLatch before it could ever hold.
     if (wasBrewing)
     {
-      targetWeightReached = false;  // Clear weight cut-off latch for next brew
-      resumeIdleBoilerFill();       // Unlock idle control and hand full pump control back to GiCar
+      shotCutOff = false;         // Clear cut-off latch for next brew
+      resumeIdleBoilerFill();     // Unlock idle control and hand full pump control back to GiCar
+      saveRememberedShotTime();   // Out of the shot, so the NVS write cannot hold up pump control
     }
 
     if (cleaningRunActive)

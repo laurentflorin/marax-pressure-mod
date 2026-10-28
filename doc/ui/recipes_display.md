@@ -192,7 +192,10 @@ lever, and the header names the recipe.
 
 - **Delete the static "Profile:" label** and widen `profileMode` to the full
   header (x 56, y 4, w 416, h 36). The firmware writes the recipe's name
-  there, or *No recipe selected* / *Brew by recipe off*.
+  there, or *No recipe selected* / *Brew by recipe off*. With no scale
+  connected it adds the time that will end the shot, as in *Ethiopia Guji
+  (27 s)*, so give `profileMode` and the global `profileModetxt` a `txt_maxl`
+  of at least 40: a 31-character name plus the time.
 - **Narrow the waveform `s0` from 350 to 300 px** and move it to x 32 (its axis
   labels to the left of it), which frees x 344–472 for the panel. The firmware
   now draws the curve preview 300 samples wide (`BREW_WAVEFORM_WIDTH`); with

@@ -34,7 +34,7 @@ Home Assistant):
 
 | | Pump | Weight cut-off | Brew page |
 | --- | --- | --- | --- |
-| **On**, recipe selected | Follows the recipe's curve | At the recipe's yield | Recipe name, panel filled in |
+| **On**, recipe selected | Follows the recipe's curve | At the recipe's yield; without the scale, after the recipe's [remembered time](#without-the-scale) | Recipe name, panel filled in |
 | **On**, no recipe selected | Full power, as stock | None | "No recipe selected" |
 | **Off** | Full power, as stock | None | "Brew by recipe off" |
 
@@ -44,6 +44,43 @@ recipe — a tile, **Use**, the *Recipe* select — switches it back on, since
 that is a request to brew by it.
 
 The selected recipe and the switch both survive a power cycle.
+
+### Without the scale
+
+With the scale connected, the weight always ends the shot. Without it the
+yield cannot be weighed, so the shot stops after as long as the same recipe
+last took to reach its yield by weight. A recipe the scale has never stopped
+has no time yet, and the lever ends the shot as usual. If the scale drops out
+mid-shot, the remembered time takes over from there.
+
+While no scale is connected, the brew page header shows the time after the
+recipe's name, rounded to the second: *Ethiopia Guji (27 s)*. It disappears as
+soon as the scale connects.
+
+A time that was measured wrong would stop every later shot without the scale
+at the wrong moment, so a shot only sets the time when nothing about it looked
+off. Any of these rules it out, and the time from before stays:
+
+| Rejected when | Catches |
+| --- | --- |
+| The scale was not connected and sending when the lever went up | Shots the weight did not stop |
+| It read more than 2 g either way as the lever went up | A scale that was not tared, or tared with a different cup |
+| The weight moved faster than 8 g/s between two readings, plus 1 g for jitter, up or down | The cup set down or lifted, a knock, a tare mid-shot |
+| More than 2 s passed between two readings | A stalled stream: the cut-off may have acted on an old weight |
+| The shot took under 10 s, or faster than 8 g/s on average to the yield | Anything else that ended it implausibly early |
+| The shot took over 2 minutes | A choked puck |
+
+Only the readings up to the cut-off count, so taking the cup away straight
+after the pump stops is fine. The serial log says which check ruled a shot
+out (`[SHOT] Not remembering 6.2s for 'House blend': too short to be a real
+shot`) and when a time is kept.
+
+The time belongs to the recipe as it was measured. Editing anything but the
+name — yield, dose, grind, temperature or the curve — leaves the recipe without
+a time until the scale has stopped a shot of it again; changing it back
+restores the old one. Deleting a recipe forgets its time. Times are kept in the
+controller's flash (NVS), not on the SD card, since they depend on the machine
+rather than the recipe file.
 
 ### What changes the selected recipe
 
@@ -119,8 +156,8 @@ jump straight to 9, hold, then ramp down to 6.
 - At most 16 points, pressure capped at 12 bar, time at 600 s. One point
   describes no span of time, so a curve needs at least two.
 - After the last point its pressure is held until the shot ends — by weight,
-  or by the lever — so a curve shorter than the shot never drops the pump to
-  zero.
+  by the remembered time without the scale, or by the lever — so a curve
+  shorter than the shot never drops the pump to zero.
 
 The firmware evaluates the curve on every loop iteration rather than once a
 second, so a ramp is genuinely smooth rather than a finer staircase. The brew

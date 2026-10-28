@@ -225,6 +225,36 @@ int main() {
   buildHomeTileText(recipeScratch, tile, sizeof(tile));
   check(std::strlen(tile) < sizeof(tile) - 1, "the longest possible tile fits");
 
+  // ── Which edits make a recipe's remembered shot time stale ──────────────
+  std::printf("\nshot-time fingerprint\n");
+  const std::string timed =
+    "name,Ethiopia Guji\ngrind,2.4\ndose,18\nyield,40\ntemp,II\n"
+    "point,0,3,ramp\npoint,8,9,jump\npoint,26,6,ramp\n";
+  auto fingerprintOf = [](const std::string &text) {
+    if (!loadFromText(text)) check(false, "parses");
+    activeRecipe = recipeScratch;
+    return recipeShotFingerprint();
+  };
+  auto edited = [&](const char *from, const char *to) {
+    std::string text = timed;
+    text.replace(text.find(from), std::strlen(from), to);
+    return text;
+  };
+  uint32_t original = fingerprintOf(timed);
+  check(fingerprintOf(timed) == original, "the same recipe loaded twice keeps its time");
+  check(fingerprintOf(edited("name,Ethiopia Guji", "name,Guji, washed")) == original,
+        "renaming keeps it");
+  check(fingerprintOf(edited("yield,40", "yield,36")) != original, "a new yield drops it");
+  check(fingerprintOf(edited("dose,18", "dose,18.5")) != original, "a new dose drops it");
+  check(fingerprintOf(edited("grind,2.4", "grind,2.2")) != original, "a new grind drops it");
+  check(fingerprintOf(edited("temp,II", "temp,I")) != original, "a new temperature drops it");
+  check(fingerprintOf(edited("point,8,9,jump", "point,8,8,jump")) != original,
+        "a different pressure drops it");
+  check(fingerprintOf(edited("point,8,9,jump", "point,10,9,jump")) != original,
+        "a point moved in time drops it");
+  check(fingerprintOf(edited("point,8,9,jump", "point,8,9,ramp")) != original,
+        "a jump made a ramp drops it");
+
   std::printf("\n%s\n", failures ? "FAILURES" : "all checks passed");
   return failures != 0;
 }
