@@ -238,12 +238,17 @@ them near the top of `marax_esp32s3.ino`:
 ```c
 #define HOME_PAGE_ID 1       // shows and hides the home tiles
 #define BREW_PAGE_ID 2       // curve preview, recipe panel
-#define CLEANING_PAGE_ID 6   // cleaning mode: flush counter, no boiler cut-off
+#define CLEANING_PAGE_ID 4   // cleaning mode: flush counter, no boiler cut-off
 ```
 
-A wrong `CLEANING_PAGE_ID` matters most: backflushing would run into the idle
-boiler-full cut-off. The serial monitor prints the current page as `page:`
-every ten seconds, so each one can be checked by opening it.
+A wrong `CLEANING_PAGE_ID` matters most: pulling the lever on the cleaning
+page would open the brew page and run the selected recipe's curve instead of
+counting a backflush at full pump. The serial monitor prints the current page
+as `page:` every ten seconds, so each one can be checked by opening it.
+
+Do not go by the `printh 23 02 50 XX` in each page's Preinitialize Event: it
+was typed in by hand and still carries the numbers from before the profile
+pages went (the cleaning page prints `06`). The firmware ignores it.
 
 ## Checking it
 
